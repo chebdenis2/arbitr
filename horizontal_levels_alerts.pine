@@ -15,14 +15,15 @@ lowerPct = input.float(3.0, "Отклонение вниз, %", minval=0.0, step
 alertMode = input.string("Touch (wick)", "Режим алерта", options=["Touch (wick)", "Cross (close)"])
 
 showLabels = input.bool(false, "Показывать подписи уровней (справа)")
+showScaleMarkers = input.bool(true, "Метки на шкале (для привязки шкалы)")
 
 upperLevel = baseLevel * (1.0 + upperPct / 100.0)
 lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
 
 // Рисуем уровни как series через plot
-plot(baseLevel,  title="BASE (1.0)",  color=color.white, linewidth=2, style=plot.style_line)
-plot(upperLevel, title="UPPER (+%)",  color=color.lime,  linewidth=1, style=plot.style_line)
-plot(lowerLevel, title="LOWER (-%)",  color=color.red,   linewidth=1, style=plot.style_line)
+plot(baseLevel,  title="BASE (1.0)",  color=color.white, linewidth=2, style=plot.style_line, trackprice=showScaleMarkers)
+plot(upperLevel, title="UPPER (+%)",  color=color.lime,  linewidth=1, style=plot.style_line, trackprice=showScaleMarkers)
+plot(lowerLevel, title="LOWER (-%)",  color=color.red,   linewidth=1, style=plot.style_line, trackprice=showScaleMarkers)
 
 // Подписи справа (обновляются на последнем баре)
 var label lblBase = na
