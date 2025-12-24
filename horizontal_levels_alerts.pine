@@ -1,5 +1,5 @@
 //@version=5
-indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, max_lines_count=50, max_labels_count=50)
+indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, scale=scale.none, max_lines_count=50, max_labels_count=50)
 
 // Центральный уровень ВСЕГДА 1.0 (для графика спреда/ratio).
 const float baseLevel = 1.0
