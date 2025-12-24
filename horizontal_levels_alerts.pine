@@ -20,13 +20,13 @@ hline(upperLevel, "Upper (+%)",       color=color.new(color.white, 0), linewidth
 hline(lowerLevel, "Lower (-%)",       color=color.new(color.white, 0), linewidth=1, linestyle=hline.style_dashed)
 
 // Условия алертов
-bool touch(float lvl) =>
+touch(float lvl) =>
     high >= lvl and low <= lvl
 
-bool crossUp(float lvl) =>
+crossUp(float lvl) =>
     ta.crossover(close, lvl)
 
-bool crossDown(float lvl) =>
+crossDown(float lvl) =>
     ta.crossunder(close, lvl)
 
 baseHit  = alertMode == "Touch (wick)" ? touch(baseLevel)  : (crossUp(baseLevel)  or crossDown(baseLevel))
