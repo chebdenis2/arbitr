@@ -1,5 +1,5 @@
 //@version=5
-indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, max_lines_count=50, max_labels_count=50)
+indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, scale=scale.right, max_lines_count=50, max_labels_count=50)
 
 // Центральный уровень ВСЕГДА 1.0 (для графика спреда/ratio).
 const float baseLevel = 1.0
@@ -16,10 +16,22 @@ showLabels = input.bool(true, "Показывать подписи уровне�
 upperLevel = baseLevel * (1.0 + upperPct / 100.0)
 lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
 
-// Линии через plot на шкале цены (важно для спредов/ratio, чтобы не было "своей" шкалы индикатора)
-plot(baseLevel,  "BASE (1.0)", color=color.white, linewidth=2, display=display.price_scale)
-plot(upperLevel, "UPPER (+%)", color=color.lime,  linewidth=1, style=plot.style_line, display=display.price_scale)
-plot(lowerLevel, "LOWER (-%)", color=color.red,   linewidth=1, style=plot.style_line, display=display.price_scale)
+// Якорь шкалы: невидимый plot спреда (close) заставляет индикатор использовать ту же шкалу.
+plot(close, "__anchor_spread__", color=color.new(color.gray, 100), linewidth=1)
+
+// Линии через line.* (надёжно и с нужными стилями)
+var line lnBase = na
+var line lnUp = na
+var line lnDn = na
+
+if barstate.isfirst
+    lnBase := line.new(bar_index, baseLevel, bar_index + 1, baseLevel, extend=extend.both, color=color.white, width=2)
+    lnUp   := line.new(bar_index, upperLevel, bar_index + 1, upperLevel, extend=extend.both, color=color.lime, width=1, style=line.style_dotted)
+    lnDn   := line.new(bar_index, lowerLevel, bar_index + 1, lowerLevel, extend=extend.both, color=color.red, width=1, style=line.style_dotted)
+else
+    line.set_y1(lnBase, baseLevel), line.set_y2(lnBase, baseLevel)
+    line.set_y1(lnUp, upperLevel),  line.set_y2(lnUp, upperLevel)
+    line.set_y1(lnDn, lowerLevel),  line.set_y2(lnDn, lowerLevel)
 
 // Подписи справа (обновляются на последнем баре)
 var label lblBase = na
