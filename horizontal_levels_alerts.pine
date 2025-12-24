@@ -7,7 +7,6 @@ const float baseLevel = 1.0
 // Настройки отклонений
 upperPct = input.float(3.0, "Отклонение вверх, %", minval=0.0, step=0.1)
 lowerPct = input.float(3.0, "Отклонение вниз, %", minval=0.0, step=0.1)
-lowerCalcMode = input.string("Reciprocal (1/(1+%))", "Как считать нижний уровень", options=["Linear (1-% )", "Reciprocal (1/(1+%))"])
 
 // Как считать срабатывание алерта
 alertMode = input.string("Touch (wick)", "Режим алерта", options=["Touch (wick)", "Cross (close)"])
@@ -15,7 +14,7 @@ alertMode = input.string("Touch (wick)", "Режим алерта", options=["To
 showLabels = input.bool(true, "Показывать подписи уровней (справа)")
 
 upperLevel = baseLevel * (1.0 + upperPct / 100.0)
-lowerLevel = lowerCalcMode == "Linear (1-% )" ? baseLevel * (1.0 - lowerPct / 100.0) : baseLevel / (1.0 + lowerPct / 100.0)
+lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
 
 // Линии через line.* (на спред/формулах часто надёжнее, чем hline)
 var line lnBase = na
