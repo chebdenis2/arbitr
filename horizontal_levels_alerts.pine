@@ -1,7 +1,7 @@
 //@version=5
 indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, max_lines_count=50, max_labels_count=50)
 
-// Центральный уровень всегда 1
+// Центральный уровень ВСЕГДА 1.0 (для графика спреда/ratio).
 const float baseLevel = 1.0
 
 // Настройки отклонений
@@ -11,13 +11,33 @@ lowerPct = input.float(3.0, "Отклонение вниз, %", minval=0.0, step
 // Как считать срабатывание алерта
 alertMode = input.string("Touch (wick)", "Режим алерта", options=["Touch (wick)", "Cross (close)"])
 
+showLabels = input.bool(true, "Показывать подписи уровней (справа)")
+
 upperLevel = baseLevel * (1.0 + upperPct / 100.0)
 lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
 
 // Линии (hline) — статичны и всегда видны
 hline(baseLevel,  "Level 1.0 (base)", color=color.white, linewidth=2, linestyle=hline.style_solid)
-hline(upperLevel, "Upper (+%)",       color=color.new(color.white, 0), linewidth=1, linestyle=hline.style_dashed)
-hline(lowerLevel, "Lower (-%)",       color=color.new(color.white, 0), linewidth=1, linestyle=hline.style_dashed)
+hline(upperLevel, "Upper (+%)",       color=color.lime,  linewidth=1, linestyle=hline.style_dotted)
+hline(lowerLevel, "Lower (-%)",       color=color.red,   linewidth=1, linestyle=hline.style_dotted)
+
+// Подписи справа (обновляются на последнем баре)
+var label lblBase = na
+var label lblUp = na
+var label lblDn = na
+
+if barstate.islast
+    if showLabels
+        label.delete(lblBase)
+        label.delete(lblUp)
+        label.delete(lblDn)
+        lblBase := label.new(bar_index, baseLevel, "1.0000 (BASE)", style=label.style_label_left, textcolor=color.black, color=color.white)
+        lblUp   := label.new(bar_index, upperLevel, str.format("+{0}%  ({1})", upperPct, str.tostring(upperLevel, format.mintick)), style=label.style_label_left, textcolor=color.black, color=color.lime)
+        lblDn   := label.new(bar_index, lowerLevel, str.format("-{0}%  ({1})", lowerPct, str.tostring(lowerLevel, format.mintick)), style=label.style_label_left, textcolor=color.white, color=color.red)
+    else
+        label.delete(lblBase)
+        label.delete(lblUp)
+        label.delete(lblDn)
 
 // Условия алертов
 touch(float lvl) =>
