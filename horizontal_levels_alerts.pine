@@ -1,5 +1,8 @@
 //@version=5
-indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, scale=scale.none, max_lines_count=50, max_labels_count=50)
+// ВАЖНО (TradingView): если на графике включено "Scale price chart only" или индикаторы на отдельной шкале,
+// линии могут визуально "не совпадать" с правой шкалой символа. Решение: на правой шкале → ПКМ → Merge scales
+// (или отключить Chart settings → Scales → Scale price chart only).
+indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, scale=scale.right, max_lines_count=50, max_labels_count=50)
 
 // Центральный уровень ВСЕГДА 1.0 (для графика спреда/ratio).
 const float baseLevel = 1.0
@@ -11,16 +14,15 @@ lowerPct = input.float(3.0, "Отклонение вниз, %", minval=0.0, step
 // Как считать срабатывание алерта
 alertMode = input.string("Touch (wick)", "Режим алерта", options=["Touch (wick)", "Cross (close)"])
 
-showLabels = input.bool(true, "Показывать подписи уровней (справа)")
+showLabels = input.bool(false, "Показывать подписи уровней (справа)")
 
 upperLevel = baseLevel * (1.0 + upperPct / 100.0)
 lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
 
-// Рисуем уровни как series через plot (самый надёжный способ привязки к шкале текущего символа)
-// trackprice=true добавляет реальную отметку на ценовой шкале в точке линии.
-plot(baseLevel,  title="BASE (1.0)",  color=color.white, linewidth=2, style=plot.style_line, trackprice=true)
-plot(upperLevel, title="UPPER (+%)",  color=color.lime,  linewidth=1, style=plot.style_line, trackprice=true)
-plot(lowerLevel, title="LOWER (-%)",  color=color.red,   linewidth=1, style=plot.style_line, trackprice=true)
+// Рисуем уровни как series через plot
+plot(baseLevel,  title="BASE (1.0)",  color=color.white, linewidth=2, style=plot.style_line)
+plot(upperLevel, title="UPPER (+%)",  color=color.lime,  linewidth=1, style=plot.style_line)
+plot(lowerLevel, title="LOWER (-%)",  color=color.red,   linewidth=1, style=plot.style_line)
 
 // Подписи справа (обновляются на последнем баре)
 var label lblBase = na
