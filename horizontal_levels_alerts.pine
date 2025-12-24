@@ -1,5 +1,5 @@
 //@version=5
-indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, scale=scale.right, max_lines_count=50, max_labels_count=50)
+indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, scale=scale.none, max_lines_count=50, max_labels_count=50)
 
 // Центральный уровень ВСЕГДА 1.0 (для графика спреда/ratio).
 const float baseLevel = 1.0
@@ -16,10 +16,7 @@ showLabels = input.bool(true, "Показывать подписи уровне�
 upperLevel = baseLevel * (1.0 + upperPct / 100.0)
 lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
 
-// Якорь шкалы: невидимый plot спреда (close) заставляет индикатор использовать ту же шкалу.
-plot(close, "__anchor_spread__", color=color.new(color.gray, 100), linewidth=1)
-
-// Линии через line.* (надёжно и с нужными стилями)
+// Линии через line.* (рисуем на шкале графика; scale=none убирает отдельную шкалу индикатора)
 var line lnBase = na
 var line lnUp = na
 var line lnDn = na
