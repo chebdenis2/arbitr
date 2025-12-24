@@ -16,19 +16,11 @@ showLabels = input.bool(true, "Показывать подписи уровне�
 upperLevel = baseLevel * (1.0 + upperPct / 100.0)
 lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
 
-// Линии через line.* (рисуем на шкале графика; scale=none убирает отдельную шкалу индикатора)
-var line lnBase = na
-var line lnUp = na
-var line lnDn = na
-
-if barstate.isfirst
-    lnBase := line.new(bar_index, baseLevel, bar_index + 1, baseLevel, extend=extend.both, color=color.white, width=2)
-    lnUp   := line.new(bar_index, upperLevel, bar_index + 1, upperLevel, extend=extend.both, color=color.lime, width=1, style=line.style_dotted)
-    lnDn   := line.new(bar_index, lowerLevel, bar_index + 1, lowerLevel, extend=extend.both, color=color.red, width=1, style=line.style_dotted)
-else
-    line.set_y1(lnBase, baseLevel), line.set_y2(lnBase, baseLevel)
-    line.set_y1(lnUp, upperLevel),  line.set_y2(lnUp, upperLevel)
-    line.set_y1(lnDn, lowerLevel),  line.set_y2(lnDn, lowerLevel)
+// Рисуем уровни как series через plot (самый надёжный способ привязки к шкале текущего символа)
+// trackprice=true добавляет реальную отметку на ценовой шкале в точке линии.
+plot(baseLevel,  title="BASE (1.0)",  color=color.white, linewidth=2, style=plot.style_line, trackprice=true)
+plot(upperLevel, title="UPPER (+%)",  color=color.lime,  linewidth=1, style=plot.style_line, trackprice=true)
+plot(lowerLevel, title="LOWER (-%)",  color=color.red,   linewidth=1, style=plot.style_line, trackprice=true)
 
 // Подписи справа (обновляются на последнем баре)
 var label lblBase = na
@@ -40,7 +32,7 @@ if barstate.islast
         label.delete(lblBase)
         label.delete(lblUp)
         label.delete(lblDn)
-        lblBase := label.new(bar_index, baseLevel, "1.0000 (BASE)", style=label.style_label_left, textcolor=color.black, color=color.white, yloc=yloc.price)
+        lblBase := label.new(bar_index, baseLevel, str.format("{0} (BASE)", str.tostring(baseLevel, format.mintick)), style=label.style_label_left, textcolor=color.black, color=color.white, yloc=yloc.price)
         lblUp   := label.new(bar_index, upperLevel, str.format("+{0}%  ({1})", upperPct, str.tostring(upperLevel, format.mintick)), style=label.style_label_left, textcolor=color.black, color=color.lime, yloc=yloc.price)
         lblDn   := label.new(bar_index, lowerLevel, str.format("-{0}%  ({1})", lowerPct, str.tostring(lowerLevel, format.mintick)), style=label.style_label_left, textcolor=color.white, color=color.red, yloc=yloc.price)
     else
