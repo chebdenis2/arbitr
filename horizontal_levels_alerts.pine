@@ -1,0 +1,45 @@
+//@version=5
+indicator("Horizontal Levels @ 1 (+/- %), with Alerts", overlay=true, max_lines_count=50, max_labels_count=50)
+
+// Центральный уровень всегда 1
+const float baseLevel = 1.0
+
+// Настройки отклонений
+upperPct = input.float(3.0, "Отклонение вверх, %", minval=0.0, step=0.1)
+lowerPct = input.float(3.0, "Отклонение вниз, %", minval=0.0, step=0.1)
+
+// Как считать срабатывание алерта
+alertMode = input.string("Touch (wick)", "Режим алерта", options=["Touch (wick)", "Cross (close)"])
+
+upperLevel = baseLevel * (1.0 + upperPct / 100.0)
+lowerLevel = baseLevel * (1.0 - lowerPct / 100.0)
+
+// Линии (hline) — статичны и всегда видны
+hline(baseLevel,  "Level 1.0 (base)", color=color.white, linewidth=2, linestyle=hline.style_solid)
+hline(upperLevel, "Upper (+%)",       color=color.new(color.white, 0), linewidth=1, linestyle=hline.style_dashed)
+hline(lowerLevel, "Lower (-%)",       color=color.new(color.white, 0), linewidth=1, linestyle=hline.style_dashed)
+
+// Условия алертов
+bool touch(float lvl) =>
+    high >= lvl and low <= lvl
+
+bool crossUp(float lvl) =>
+    ta.crossover(close, lvl)
+
+bool crossDown(float lvl) =>
+    ta.crossunder(close, lvl)
+
+baseHit  = alertMode == "Touch (wick)" ? touch(baseLevel)  : (crossUp(baseLevel)  or crossDown(baseLevel))
+upperHit = alertMode == "Touch (wick)" ? touch(upperLevel) : (crossUp(upperLevel) or crossDown(upperLevel))
+lowerHit = alertMode == "Touch (wick)" ? touch(lowerLevel) : (crossUp(lowerLevel) or crossDown(lowerLevel))
+
+// Отдельные условия (удобнее для разных алертов)
+alertcondition(baseHit,  "Base level hit (1.0)",  "Price hit base level 1.0")
+alertcondition(upperHit, "Upper level hit (+%)",  "Price hit upper level (+%)")
+alertcondition(lowerHit, "Lower level hit (-%)",  "Price hit lower level (-%)")
+
+// Если нужно разделять направление при режиме Cross (close)
+alertcondition(alertMode == "Cross (close)" and crossUp(upperLevel),   "Cross UP upper (+%)",  "Close crossed UP upper (+%)")
+alertcondition(alertMode == "Cross (close)" and crossDown(upperLevel), "Cross DOWN upper (+%)","Close crossed DOWN upper (+%)")
+alertcondition(alertMode == "Cross (close)" and crossUp(lowerLevel),   "Cross UP lower (-%)",  "Close crossed UP lower (-%)")
+alertcondition(alertMode == "Cross (close)" and crossDown(lowerLevel), "Cross DOWN lower (-%)","Close crossed DOWN lower (-%)")
