@@ -48,11 +48,10 @@ class StrategyConfig:
     ticker: str = "SOLUSD"
     direction: str = "LONG"  # LONG|SHORT
     poll_interval_sec: int = 3
-    # VWAP mode:
-    # - Rolling window by timeframe (recommended for "timeframe 1h" style strategies)
-    vwap_timeframe: str = "1h"  # e.g. 1h, 4h. Currently supports "1h" only.
-    # - Anchor-based VWAP (optional)
-    anchor_period: str = "Session"  # Session|Week|Month|Year (used only if vwap_timeframe is empty)
+    # Candle timeframe used for "new candle" refresh logic (like original bot).
+    timeframe: str = "1h"
+    # VWAP anchor period (like original bot).
+    anchor_period: str = "Session"  # Session|Week|Month|Year
 
     # One entry level
     entry_distance_long_pct: Decimal = Decimal("1.0")  # % from VWAP for LONG
@@ -69,6 +68,7 @@ class StrategyConfig:
     pause_on_sl: bool = False
     max_trade_pages: int = 6  # VWAP from public trades: pages*limit trades
     trades_page_limit: int = 200  # API constraint: max 200
+    vwap_recalc_threshold: Decimal = Decimal("0.0005")  # 0.05% like original bot
 
 
 class EtherealVWAPStrategy:
@@ -155,6 +155,11 @@ class EtherealVWAPStrategy:
         self.state.setdefault("pause_reason", None)
         self.state.setdefault("paused_at", None)
         self.state.setdefault("last_anchor_start_ms", 0)
+        self.state.setdefault("last_candle_start_ms", 0)
+        # VWAP accumulator from anchor (using trades VWAP: sum(price*qty)/sum(qty))
+        self.state.setdefault("cum_pq", "0")
+        self.state.setdefault("cum_q", "0")
+        self.state.setdefault("last_trade_ts", 0)  # ms timestamp of last processed trade
 
     def _save_state(self) -> None:
         with open(self.state_file, "w", encoding="utf-8") as f:
@@ -163,6 +168,30 @@ class EtherealVWAPStrategy:
     # ---------------------------
     # Anchor + VWAP
     # ---------------------------
+    @staticmethod
+    def _timeframe_ms(tf: str) -> int:
+        s = (tf or "").strip().lower()
+        if not s:
+            raise ValueError("timeframe is empty")
+        # formats like 1m, 3m, 1h, 4h, 1d
+        num = ""
+        unit = ""
+        for ch in s:
+            if ch.isdigit():
+                num += ch
+            else:
+                unit += ch
+        if not num or not unit:
+            raise ValueError(f"Unsupported timeframe '{tf}' (expected like 1h, 3m)")
+        n = int(num)
+        if unit == "m":
+            return n * 60_000
+        if unit == "h":
+            return n * 3_600_000
+        if unit == "d":
+            return n * 86_400_000
+        raise ValueError(f"Unsupported timeframe unit '{unit}' in '{tf}'")
+
     def _anchor_start(self, t: datetime) -> datetime:
         t = t.astimezone(timezone.utc)
         p = self.cfg.anchor_period
@@ -205,13 +234,16 @@ class EtherealVWAPStrategy:
         has_next = bool(res.get("hasNext"))
         return data, next_cursor, has_next
 
-    async def calculate_vwap(self, anchor_start_ms: int) -> Decimal:
-        """VWAP from public trades since anchor (price*qty / qty)."""
-        sum_pq = Decimal("0")
-        sum_q = Decimal("0")
+    async def _sync_vwap_from_trades(self, anchor_start_ms: int) -> Decimal:
+        """Incrementally update VWAP accumulators from public trades since last_trade_ts."""
+        last_ts = int(self.state.get("last_trade_ts") or 0)
+        if last_ts <= 0:
+            last_ts = anchor_start_ms
 
         cursor: Optional[str] = None
         pages = 0
+        batch: list[dict] = []
+
         while pages < int(self.cfg.max_trade_pages):
             trades, next_cursor, has_next = await self._fetch_public_trades_page(cursor)
             if not trades:
@@ -220,24 +252,46 @@ class EtherealVWAPStrategy:
             stop = False
             for t in trades:
                 ts = int(t.get("createdAt") or 0)
+                if ts and ts <= last_ts:
+                    stop = True
+                    break
                 if ts and ts < anchor_start_ms:
                     stop = True
                     break
-                price = _as_decimal(t.get("price") or "0")
-                qty = _as_decimal(t.get("filled") or "0")
-                if price <= 0 or qty <= 0:
-                    continue
-                sum_pq += price * qty
-                sum_q += qty
+                batch.append(t)
 
             pages += 1
             if stop or not has_next or not next_cursor:
                 break
             cursor = next_cursor
 
-        if sum_q <= 0:
+        if batch:
+            # trades were fetched in desc; process in chronological order
+            batch.sort(key=lambda x: int(x.get("createdAt") or 0))
+            cum_pq = _as_decimal(self.state.get("cum_pq") or "0")
+            cum_q = _as_decimal(self.state.get("cum_q") or "0")
+            max_ts = last_ts
+
+            for t in batch:
+                ts = int(t.get("createdAt") or 0)
+                price = _as_decimal(t.get("price") or "0")
+                qty = _as_decimal(t.get("filled") or "0")
+                if ts <= 0 or price <= 0 or qty <= 0:
+                    continue
+                cum_pq += price * qty
+                cum_q += qty
+                if ts > max_ts:
+                    max_ts = ts
+
+            self.state["cum_pq"] = str(cum_pq)
+            self.state["cum_q"] = str(cum_q)
+            self.state["last_trade_ts"] = max_ts
+            self._save_state()
+
+        cum_q_now = _as_decimal(self.state.get("cum_q") or "0")
+        if cum_q_now <= 0:
             return Decimal("NaN")
-        return sum_pq / sum_q
+        return _as_decimal(self.state.get("cum_pq") or "0") / cum_q_now
 
     # ---------------------------
     # Market + rounding helpers
@@ -452,29 +506,34 @@ class EtherealVWAPStrategy:
         assert self.subaccount_id is not None and self.product_id is not None
 
         now = _utc_now()
-        # VWAP window start:
-        # - If vwap_timeframe is set, use rolling window (default 1h).
-        # - Otherwise, use anchor-based start time.
-        vwap_timeframe = (self.cfg.vwap_timeframe or "").strip().lower()
-        if vwap_timeframe:
-            if vwap_timeframe != "1h":
-                raise RuntimeError("Only vwap_timeframe='1h' is supported right now.")
-            window_start_ms = _dt_to_ms(now - timedelta(hours=1))
-        else:
-            anchor_start = self._anchor_start(now)
-            anchor_start_ms = _dt_to_ms(anchor_start)
-            window_start_ms = anchor_start_ms
+        now_ms = _dt_to_ms(now)
 
-            prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
-            if prev_anchor != anchor_start_ms:
-                self.state["last_anchor_start_ms"] = anchor_start_ms
-                self._save_state()
-                # Re-anchor: cancel pending entry (new VWAP regime)
-                await self._cancel_entry()
-                logger.info("New anchor period: %s", anchor_start.isoformat())
+        # Anchor-based VWAP (like original).
+        anchor_start = self._anchor_start(now)
+        anchor_start_ms = _dt_to_ms(anchor_start)
+        prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
+        if prev_anchor != anchor_start_ms:
+            # Reset VWAP accumulators for new anchor period
+            self.state["last_anchor_start_ms"] = anchor_start_ms
+            self.state["cum_pq"] = "0"
+            self.state["cum_q"] = "0"
+            self.state["last_trade_ts"] = anchor_start_ms
+            self._save_state()
+            await self._cancel_entry()
+            await self._cancel_exits()
+            logger.info("New anchor period: %s", anchor_start.isoformat())
+
+        # Candle boundary (timeframe) for "full refresh" logic (like original).
+        tf_ms = self._timeframe_ms(self.cfg.timeframe)
+        candle_start_ms = now_ms - (now_ms % tf_ms)
+        is_new_candle = int(self.state.get("last_candle_start_ms") or 0) != candle_start_ms
+        if is_new_candle:
+            self.state["last_candle_start_ms"] = candle_start_ms
+            self._save_state()
+            logger.info("NEW CANDLE %s — full refresh", _ms_to_dt(candle_start_ms).isoformat())
 
         price = await self.get_oracle_price()
-        vwap = await self.calculate_vwap(window_start_ms)
+        vwap = await self._sync_vwap_from_trades(anchor_start_ms)
         entry_px, tp_px, sl_px = self._levels(vwap)
 
         pos = await self._get_open_position()
@@ -510,7 +569,9 @@ class EtherealVWAPStrategy:
                     logger.warning("PAUSED: stop-loss hit. Will resume after opposite L1 touch.")
                     return
 
-            # Ensure only one entry order
+            # On every new candle, re-place entry at fresh level (like original).
+            if is_new_candle:
+                await self._cancel_entry()
             await self._ensure_entry_order(entry_px)
             return
 
@@ -520,7 +581,9 @@ class EtherealVWAPStrategy:
             await self._cancel_entry()
             self._save_state()
 
-        # Ensure exits exist (OCO TP+SL), update if missing
+        # Ensure exits exist (OCO TP+SL). On each new candle we refresh exits to follow VWAP.
+        if is_new_candle:
+            await self._cancel_exits()
         await self._ensure_oco_exits(pos, tp_px, sl_px)
 
     async def run(self) -> None:
@@ -547,7 +610,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
             ticker=str(raw.get("ticker", "SOLUSD")),
             direction=str(raw.get("direction", "LONG")).upper(),
             poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
-            vwap_timeframe=str(raw.get("vwap_timeframe", "1h")),
+            timeframe=str(raw.get("timeframe", "1h")),
             anchor_period=str(raw.get("anchor_period", "Session")),
             entry_distance_long_pct=_as_decimal(raw.get("entry_distance_long_pct", "1.0")),
             entry_distance_short_pct=_as_decimal(raw.get("entry_distance_short_pct", "1.5")),
@@ -559,6 +622,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
             pause_on_sl=bool(raw.get("pause_on_sl", False)),
             max_trade_pages=int(raw.get("max_trade_pages", 6)),
             trades_page_limit=trades_page_limit,
+            vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
             ),
             False,
         )
@@ -570,7 +634,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "poll_interval_sec": cfg.poll_interval_sec,
-                "vwap_timeframe": cfg.vwap_timeframe,
+                "timeframe": cfg.timeframe,
                 "anchor_period": cfg.anchor_period,
                 "entry_distance_long_pct": str(cfg.entry_distance_long_pct),
                 "entry_distance_short_pct": str(cfg.entry_distance_short_pct),
@@ -582,6 +646,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "pause_on_sl": cfg.pause_on_sl,
                 "max_trade_pages": cfg.max_trade_pages,
                 "trades_page_limit": cfg.trades_page_limit,
+                "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
             },
             f,
             indent=2,
