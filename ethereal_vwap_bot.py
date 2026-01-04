@@ -93,7 +93,7 @@ class EtherealVWAPStrategy:
         self.config_file = f"strategy_config_{self.direction}_{cfg.ticker}.json"
 
         self.subaccount_index = subaccount_index
-        self.subaccount_id: Optional[str] = None
+        self.subaccount_id: Optional[UUID] = None
         self.subaccount_name: Optional[str] = None
         self.product_id: Optional[UUID] = None
 
@@ -126,15 +126,16 @@ class EtherealVWAPStrategy:
             raise RuntimeError(f"Unknown ticker {self.cfg.ticker}. Available: {', '.join(sorted(products.keys()))}")
         p = products[self.cfg.ticker]
         self.product_id = p.id
-        self.product_tick_size = _as_decimal(getattr(p, "tickSize", "0") or "0")
-        self.product_lot_size = _as_decimal(getattr(p, "lotSize", "0") or "0")
+        # SDK models expose snake_case attributes (tick_size/lot_size); aliases are tickSize/lotSize.
+        self.product_tick_size = _as_decimal(getattr(p, "tick_size", None) or getattr(p, "tickSize", "0") or "0")
+        self.product_lot_size = _as_decimal(getattr(p, "lot_size", None) or getattr(p, "lotSize", "0") or "0")
 
         logger.info(
             "Initialized: ticker=%s product_id=%s subaccount=%s (%s)",
             self.cfg.ticker,
             str(self.product_id),
             self.subaccount_name,
-            self.subaccount_id,
+            str(self.subaccount_id),
         )
 
         # Trading endpoints require an ACTIVE linked signer.
@@ -348,7 +349,7 @@ class EtherealVWAPStrategy:
     async def _get_open_position(self) -> Optional[dict]:
         assert self.subaccount_id is not None and self.product_id is not None
         positions = await self.client.list_positions(
-            subaccount_id=self.subaccount_id,
+            subaccount_id=str(self.subaccount_id),
             product_ids=[str(self.product_id)],
             open=True,
         )
@@ -394,7 +395,7 @@ class EtherealVWAPStrategy:
             return False
 
         try:
-            signers = await self.client.list_signers(subaccount_id=self.subaccount_id, limit=50)
+            signers = await self.client.list_signers(subaccount_id=str(self.subaccount_id), limit=50)
         except Exception as e:
             logger.warning("Could not fetch linked signers: %s", e)
             signers = []
@@ -418,7 +419,7 @@ class EtherealVWAPStrategy:
                 sender=sender,
                 signer=sender,
                 subaccount=self.subaccount_name,
-                subaccount_id=UUID(self.subaccount_id),
+                subaccount_id=self.subaccount_id,
                 include_signature=False,
             )
             dto = await self.client.sign_linked_signer(dto, signer_private_key=pk, private_key=pk)
@@ -430,7 +431,7 @@ class EtherealVWAPStrategy:
 
         # Re-check status (may still be pending)
         try:
-            signers = await self.client.list_signers(subaccount_id=self.subaccount_id, limit=50)
+            signers = await self.client.list_signers(subaccount_id=str(self.subaccount_id), limit=50)
             for s in signers:
                 if (getattr(s, "signer", "") or "").lower() == sender.lower():
                     status = str(getattr(s, "status", "") or "").upper()
