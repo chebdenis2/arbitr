@@ -141,14 +141,7 @@ class EtherealVWAPStrategy:
             self.subaccount_name,
             str(self.subaccount_id),
         )
-
-        # Trading endpoints require an ACTIVE linked signer.
-        ok = await self._ensure_signer_active()
-        if not ok:
-            logger.warning(
-                "Signer is not ACTIVE yet for this subaccount. "
-                "Linking signers can take time to finalize onchain; until then trading will return 401."
-            )
+        # Note: linked signers are optional. The subaccount owner can trade without linking a separate signer.
 
     # ---------------------------
     # Persistence
@@ -395,71 +388,19 @@ class EtherealVWAPStrategy:
         self.state["exit_orders"] = {"tp": None, "sl": None}
         self.state["exit_group_id"] = None
 
-    async def _ensure_signer_active(self) -> bool:
-        """Ensure current sender address is linked and ACTIVE for this subaccount."""
-        if not self.subaccount_id or not self.subaccount_name:
-            return False
-        sender = getattr(getattr(self.client, "chain", None), "address", None)
-        if not sender:
-            logger.error("No chain address available (sender). Check ETHEREAL_PRIVATE_KEY / chain_config.")
-            return False
-
+    async def _debug_linked_signers(self) -> None:
+        """Optional helper: prints linked signers (does not affect trading)."""
+        if not self.subaccount_id:
+            return
         try:
             signers = await self.client.list_signers(subaccount_id=str(self.subaccount_id), limit=50)
-        except Exception as e:
-            logger.warning("Could not fetch linked signers: %s", e)
-            signers = []
-
-        for s in signers:
-            if (getattr(s, "signer", "") or "").lower() == sender.lower():
-                status = str(getattr(s, "status", "") or "").upper()
-                if status == "ACTIVE":
-                    return True
-                logger.warning("Linked signer status for %s is %s (need ACTIVE).", sender, status)
-                return False
-
-        # Not linked: attempt to link signer==sender using the same private key for both signatures.
-        try:
-            pk = getattr(getattr(self.client, "chain", None), "private_key", None)
-            if not pk:
-                logger.error("No private key available in chain client (cannot link signer).")
-                return False
-
-            dto = await self.client.prepare_linked_signer(
-                sender=sender,
-                signer=sender,
-                subaccount=self.subaccount_name,
-                subaccount_id=self.subaccount_id,
-                include_signature=False,
-            )
-            dto = await self.client.sign_linked_signer(dto, signer_private_key=pk, private_key=pk)
-            await self.client.link_linked_signer(dto)
-            logger.info("Submitted link-signer request for %s. Waiting for ACTIVE...", sender)
-        except Exception as e:
-            msg = str(e)
-            # Common case: the signer address is already bound to a subaccount (Ethereal constraint).
-            if "Signer already has a subaccount" in msg:
-                logger.error(
-                    "Cannot auto-link signer %s: it is already bound to another subaccount. "
-                    "Use a different signer address/key, or manage linked signers in the Ethereal UI.",
-                    sender,
-                )
-                return False
-            logger.error("Failed to link signer (may require manual linking in UI): %s", e)
-            return False
-
-        # Re-check status (may still be pending)
-        try:
-            signers = await self.client.list_signers(subaccount_id=str(self.subaccount_id), limit=50)
-            for s in signers:
-                if (getattr(s, "signer", "") or "").lower() == sender.lower():
-                    status = str(getattr(s, "status", "") or "").upper()
-                    logger.info("Linked signer status after submit: %s", status)
-                    return status == "ACTIVE"
         except Exception:
-            pass
-
-        return False
+            return
+        if not signers:
+            return
+        logger.info("Linked signers for subaccount %s:", str(self.subaccount_id))
+        for s in signers:
+            logger.info("  signer=%s status=%s expiresAt=%s", getattr(s, "signer", None), getattr(s, "status", None), getattr(s, "expires_at", None))
 
     def _mk_client_order_id(self, kind: str) -> str:
         """
@@ -507,9 +448,11 @@ class EtherealVWAPStrategy:
             logger.info("ENTRY placed: %s qty=%s px=%s (order_id=%s)", self.direction, qty, entry_px, oid)
         except Exception as e:
             logger.error("Failed to place ENTRY: %r", e)
-            # Common failure: 401 when signer is not linked/ACTIVE.
             if "401" in str(e) or "Unauthorized" in str(e):
-                await self._ensure_signer_active()
+                logger.error(
+                    "Got 401 Unauthorized. Check ETHEREAL_TESTNET/ETHEREAL_BASE_URL match, and that this key "
+                    "is allowed to trade on this subaccount. Linked signers are only needed if trading via a separate signer."
+                )
 
     async def _ensure_oco_exits(self, pos: dict, tp_px: Decimal, sl_px: Decimal) -> None:
         if self.state.get("exit_order_ids"):
