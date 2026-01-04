@@ -96,15 +96,22 @@ class EtherealVWAPStrategy:
         self._load_state()
 
     async def initialize(self) -> None:
-        subs = await self.client.subaccounts()
-        if not subs:
-            raise RuntimeError("No subaccounts found. Deposit USDe first to create a subaccount.")
-        idx = int(self.subaccount_index)
-        if idx < 0 or idx >= len(subs):
-            raise RuntimeError(f"subaccount_index={idx} is out of range. Found {len(subs)} subaccounts.")
+        # If the user already provided both identifiers, we can skip discovery.
+        # Note: Ethereal uses the subaccount *name* (bytes/hex string) for signing.
+        if not (self.subaccount_id and self.subaccount_name):
+            subs = await self.client.subaccounts()
+            if not subs:
+                raise RuntimeError(
+                    "No subaccounts found for this key. On Ethereal, a subaccount is created only after you "
+                    "deposit USDe. Deposit (testnet: https://deposit.etherealtest.net, mainnet: https://deposit.ethereal.trade) "
+                    "then re-run the bot."
+                )
+            idx = int(self.subaccount_index)
+            if idx < 0 or idx >= len(subs):
+                raise RuntimeError(f"subaccount_index={idx} is out of range. Found {len(subs)} subaccounts.")
 
-        self.subaccount_id = subs[idx].id
-        self.subaccount_name = subs[idx].name
+            self.subaccount_id = subs[idx].id
+            self.subaccount_name = subs[idx].name
 
         products = await self.client.products_by_ticker()
         if self.cfg.ticker not in products:
@@ -508,11 +515,12 @@ class EtherealVWAPStrategy:
             await asyncio.sleep(int(self.cfg.poll_interval_sec))
 
 
-def _load_or_create_config(path: str) -> StrategyConfig:
+def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        return StrategyConfig(
+        return (
+            StrategyConfig(
             ticker=str(raw.get("ticker", "BTCUSD")),
             direction=str(raw.get("direction", "LONG")).upper(),
             poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -526,6 +534,8 @@ def _load_or_create_config(path: str) -> StrategyConfig:
             pause_on_sl=bool(raw.get("pause_on_sl", False)),
             max_trade_pages=int(raw.get("max_trade_pages", 6)),
             trades_page_limit=int(raw.get("trades_page_limit", 500)),
+            ),
+            False,
         )
 
     cfg = StrategyConfig()
@@ -550,7 +560,7 @@ def _load_or_create_config(path: str) -> StrategyConfig:
             indent=2,
         )
     logger.info("Config created: %s (edit it and re-run)", path)
-    return cfg
+    return cfg, True
 
 
 async def amain() -> None:
@@ -565,7 +575,10 @@ async def amain() -> None:
     ticker = (os.getenv("ETHEREAL_TICKER") or "BTCUSD").strip().upper()
     direction = (os.getenv("ETHEREAL_DIRECTION") or "LONG").strip().upper()
     config_path = f"strategy_config_{direction}_{ticker}.json"
-    cfg = _load_or_create_config(config_path)
+    cfg, created = _load_or_create_config(config_path)
+    if created:
+        # Avoid continuing with defaults on first run (prevents confusing errors).
+        return
 
     # allow env overrides (optional)
     if os.getenv("ETHEREAL_ENTRY_QTY"):
@@ -584,7 +597,11 @@ async def amain() -> None:
     )
     try:
         strat = EtherealVWAPStrategy(client, cfg, subaccount_index=sub_idx)
-        await strat.initialize()
+        try:
+            await strat.initialize()
+        except RuntimeError as e:
+            logger.error(str(e))
+            return
         await strat.run()
     finally:
         await client.close()
