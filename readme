@@ -1,1 +1,40 @@
-Arbitr for TradingView
+Ethereal VWAP bot (1 entry + 1 exit bracket)
+
+This repo now contains a simplified VWAP strategy adapted for `app.ethereal.trade`:
+- **1 entry**: single LIMIT order at VWAP ± entry_distance%
+- **1 exit**: OCO bracket (TP + SL) sized to the full position
+
+### Install
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+### Run (testnet by default)
+
+Set your private key (EVM) and run:
+
+```bash
+export ETHEREAL_PRIVATE_KEY="0x..."
+export ETHEREAL_TESTNET=1
+python3 ethereal_vwap_bot.py
+```
+
+### Configuration
+
+On first run it will create a config file like:
+`strategy_config_LONG_BTCUSD.json`
+
+Edit it to change:
+- `entry_distance_pct`
+- `entry_quantity`
+- `tp_pct` / `sl_pct`
+- `anchor_period` (Session/Week/Month/Year)
+
+### Optional env vars
+
+- `ETHEREAL_TICKER` (default `BTCUSD`)
+- `ETHEREAL_DIRECTION` (default `LONG`)
+- `ETHEREAL_SUBACCOUNT_INDEX` (default `0`)
+- `ETHEREAL_BASE_URL` (override API host)
+- `ETHEREAL_RPC_URL` (override chain RPC)
