@@ -99,6 +99,8 @@ class EtherealVWAPStrategy:
 
         self.product_tick_size: Decimal = Decimal("0")
         self.product_lot_size: Decimal = Decimal("0")
+        self.product_min_qty: Decimal = Decimal("0")
+        self.product_max_qty: Decimal = Decimal("0")
 
         self.state: Dict[str, Any] = {}
         self._load_state()
@@ -129,6 +131,8 @@ class EtherealVWAPStrategy:
         # SDK models expose snake_case attributes (tick_size/lot_size); aliases are tickSize/lotSize.
         self.product_tick_size = _as_decimal(getattr(p, "tick_size", None) or getattr(p, "tickSize", "0") or "0")
         self.product_lot_size = _as_decimal(getattr(p, "lot_size", None) or getattr(p, "lotSize", "0") or "0")
+        self.product_min_qty = _as_decimal(getattr(p, "min_quantity", None) or getattr(p, "minQuantity", "0") or "0")
+        self.product_max_qty = _as_decimal(getattr(p, "max_quantity", None) or getattr(p, "maxQuantity", "0") or "0")
 
         logger.info(
             "Initialized: ticker=%s product_id=%s subaccount=%s (%s)",
@@ -321,7 +325,13 @@ class EtherealVWAPStrategy:
         return _quantize_down(px, self.product_tick_size)
 
     def _round_qty(self, qty: Decimal) -> Decimal:
-        return _quantize_down(qty, self.product_lot_size)
+        q = _quantize_down(qty, self.product_lot_size)
+        # Enforce product min/max constraints.
+        if self.product_min_qty and q < self.product_min_qty:
+            q = _quantize_down(self.product_min_qty, self.product_lot_size)
+        if self.product_max_qty and q > self.product_max_qty:
+            q = _quantize_down(self.product_max_qty, self.product_lot_size)
+        return q
 
     def _levels(self, vwap: Decimal) -> Tuple[Decimal, Decimal, Decimal]:
         """(entry, tp, sl) based on VWAP and config."""
@@ -426,6 +436,15 @@ class EtherealVWAPStrategy:
             await self.client.link_linked_signer(dto)
             logger.info("Submitted link-signer request for %s. Waiting for ACTIVE...", sender)
         except Exception as e:
+            msg = str(e)
+            # Common case: the signer address is already bound to a subaccount (Ethereal constraint).
+            if "Signer already has a subaccount" in msg:
+                logger.error(
+                    "Cannot auto-link signer %s: it is already bound to another subaccount. "
+                    "Use a different signer address/key, or manage linked signers in the Ethereal UI.",
+                    sender,
+                )
+                return False
             logger.error("Failed to link signer (may require manual linking in UI): %s", e)
             return False
 
