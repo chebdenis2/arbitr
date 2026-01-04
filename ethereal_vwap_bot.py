@@ -45,19 +45,24 @@ def _quantize_down(x: Decimal, step: Decimal) -> Decimal:
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    ticker: str = "BTCUSD"
+    ticker: str = "SOLUSD"
     direction: str = "LONG"  # LONG|SHORT
     poll_interval_sec: int = 3
-    anchor_period: str = "Session"  # Session|Week|Month|Year
+    # VWAP mode:
+    # - Rolling window by timeframe (recommended for "timeframe 1h" style strategies)
+    vwap_timeframe: str = "1h"  # e.g. 1h, 4h. Currently supports "1h" only.
+    # - Anchor-based VWAP (optional)
+    anchor_period: str = "Session"  # Session|Week|Month|Year (used only if vwap_timeframe is empty)
 
     # One entry level
-    entry_distance_pct: Decimal = Decimal("0.10")  # % from VWAP
+    entry_distance_long_pct: Decimal = Decimal("1.0")  # % from VWAP for LONG
+    entry_distance_short_pct: Decimal = Decimal("1.5")  # % from VWAP for SHORT
     entry_quantity: Decimal = Decimal("0.001")  # base asset qty
     post_only: bool = True
 
     # One exit "bracket" (OCO TP+SL)
     tp_pct: Decimal = Decimal("0")  # % from VWAP
-    sl_pct: Decimal = Decimal("2.5")  # % from VWAP
+    sl_pct: Decimal = Decimal("4.0")  # % from VWAP
     exits_as_stop_market: bool = True
 
     # Safety
@@ -256,7 +261,7 @@ class EtherealVWAPStrategy:
         if not (vwap == vwap) or vwap <= 0:
             return Decimal("NaN"), Decimal("NaN"), Decimal("NaN")
 
-        p_entry = self.cfg.entry_distance_pct
+        p_entry = self.cfg.entry_distance_long_pct if self.direction == "LONG" else self.cfg.entry_distance_short_pct
         p_tp = self.cfg.tp_pct
         p_sl = self.cfg.sl_pct
 
@@ -433,7 +438,7 @@ class EtherealVWAPStrategy:
             return True
         if not (price == price) or price <= 0 or not (vwap == vwap) or vwap <= 0:
             return False
-        p = self.cfg.entry_distance_pct
+        p = self.cfg.entry_distance_long_pct if self.direction == "LONG" else self.cfg.entry_distance_short_pct
         if p <= 0:
             return False
         # Same logic as your Bybit version: after SL, wait for opposite L1 touch
@@ -447,19 +452,29 @@ class EtherealVWAPStrategy:
         assert self.subaccount_id is not None and self.product_id is not None
 
         now = _utc_now()
-        anchor_start = self._anchor_start(now)
-        anchor_start_ms = _dt_to_ms(anchor_start)
+        # VWAP window start:
+        # - If vwap_timeframe is set, use rolling window (default 1h).
+        # - Otherwise, use anchor-based start time.
+        vwap_timeframe = (self.cfg.vwap_timeframe or "").strip().lower()
+        if vwap_timeframe:
+            if vwap_timeframe != "1h":
+                raise RuntimeError("Only vwap_timeframe='1h' is supported right now.")
+            window_start_ms = _dt_to_ms(now - timedelta(hours=1))
+        else:
+            anchor_start = self._anchor_start(now)
+            anchor_start_ms = _dt_to_ms(anchor_start)
+            window_start_ms = anchor_start_ms
 
-        prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
-        if prev_anchor != anchor_start_ms:
-            self.state["last_anchor_start_ms"] = anchor_start_ms
-            self._save_state()
-            # Re-anchor: cancel pending entry (new VWAP regime)
-            await self._cancel_entry()
-            logger.info("New anchor period: %s", anchor_start.isoformat())
+            prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
+            if prev_anchor != anchor_start_ms:
+                self.state["last_anchor_start_ms"] = anchor_start_ms
+                self._save_state()
+                # Re-anchor: cancel pending entry (new VWAP regime)
+                await self._cancel_entry()
+                logger.info("New anchor period: %s", anchor_start.isoformat())
 
         price = await self.get_oracle_price()
-        vwap = await self.calculate_vwap(anchor_start_ms)
+        vwap = await self.calculate_vwap(window_start_ms)
         entry_px, tp_px, sl_px = self._levels(vwap)
 
         pos = await self._get_open_position()
@@ -529,15 +544,17 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
         trades_page_limit = min(max(trades_page_limit, 1), 200)
         return (
             StrategyConfig(
-            ticker=str(raw.get("ticker", "BTCUSD")),
+            ticker=str(raw.get("ticker", "SOLUSD")),
             direction=str(raw.get("direction", "LONG")).upper(),
             poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
+            vwap_timeframe=str(raw.get("vwap_timeframe", "1h")),
             anchor_period=str(raw.get("anchor_period", "Session")),
-            entry_distance_pct=_as_decimal(raw.get("entry_distance_pct", "0.10")),
+            entry_distance_long_pct=_as_decimal(raw.get("entry_distance_long_pct", "1.0")),
+            entry_distance_short_pct=_as_decimal(raw.get("entry_distance_short_pct", "1.5")),
             entry_quantity=_as_decimal(raw.get("entry_quantity", "0.001")),
             post_only=bool(raw.get("post_only", True)),
             tp_pct=_as_decimal(raw.get("tp_pct", "0")),
-            sl_pct=_as_decimal(raw.get("sl_pct", "2.5")),
+            sl_pct=_as_decimal(raw.get("sl_pct", "4.0")),
             exits_as_stop_market=bool(raw.get("exits_as_stop_market", True)),
             pause_on_sl=bool(raw.get("pause_on_sl", False)),
             max_trade_pages=int(raw.get("max_trade_pages", 6)),
@@ -553,8 +570,10 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "poll_interval_sec": cfg.poll_interval_sec,
+                "vwap_timeframe": cfg.vwap_timeframe,
                 "anchor_period": cfg.anchor_period,
-                "entry_distance_pct": str(cfg.entry_distance_pct),
+                "entry_distance_long_pct": str(cfg.entry_distance_long_pct),
+                "entry_distance_short_pct": str(cfg.entry_distance_short_pct),
                 "entry_quantity": str(cfg.entry_quantity),
                 "post_only": cfg.post_only,
                 "tp_pct": str(cfg.tp_pct),
