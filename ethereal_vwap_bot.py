@@ -63,7 +63,7 @@ class StrategyConfig:
     # Safety
     pause_on_sl: bool = False
     max_trade_pages: int = 6  # VWAP from public trades: pages*limit trades
-    trades_page_limit: int = 500
+    trades_page_limit: int = 200  # API constraint: max 200
 
 
 class EtherealVWAPStrategy:
@@ -176,11 +176,16 @@ class EtherealVWAPStrategy:
         self, cursor: Optional[str]
     ) -> Tuple[list[dict], Optional[str], bool]:
         assert self.product_id is not None
+        limit = int(self.cfg.trades_page_limit)
+        # Ethereal API constraint (observed): limit must be <= 200
+        if limit <= 0:
+            limit = 200
+        limit = min(limit, 200)
         params: Dict[str, Any] = {
             "productId": self.product_id,
             "order": "desc",
             "orderBy": "createdAt",
-            "limit": int(self.cfg.trades_page_limit),
+            "limit": limit,
         }
         if cursor:
             params["cursor"] = cursor
@@ -519,6 +524,9 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        trades_page_limit = int(raw.get("trades_page_limit", 200))
+        # clamp to API max
+        trades_page_limit = min(max(trades_page_limit, 1), 200)
         return (
             StrategyConfig(
             ticker=str(raw.get("ticker", "BTCUSD")),
@@ -533,7 +541,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
             exits_as_stop_market=bool(raw.get("exits_as_stop_market", True)),
             pause_on_sl=bool(raw.get("pause_on_sl", False)),
             max_trade_pages=int(raw.get("max_trade_pages", 6)),
-            trades_page_limit=int(raw.get("trades_page_limit", 500)),
+            trades_page_limit=trades_page_limit,
             ),
             False,
         )
