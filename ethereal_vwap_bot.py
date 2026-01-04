@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
+from uuid import UUID
 
 from ethereal import AsyncRESTClient
 
@@ -60,7 +61,7 @@ class StrategyConfig:
     post_only: bool = True
 
     # One exit "bracket" (OCO TP+SL)
-    tp_pct: Decimal = Decimal("0")  # % from VWAP
+    tp_pct: Decimal = Decimal("1.5")  # % from VWAP
     sl_pct: Decimal = Decimal("4.0")  # % from VWAP
     exits_as_stop_market: bool = True
 
@@ -92,7 +93,7 @@ class EtherealVWAPStrategy:
         self.subaccount_index = subaccount_index
         self.subaccount_id: Optional[str] = None
         self.subaccount_name: Optional[str] = None
-        self.product_id: Optional[str] = None
+        self.product_id: Optional[UUID] = None
 
         self.product_tick_size: Decimal = Decimal("0")
         self.product_lot_size: Decimal = Decimal("0")
@@ -122,7 +123,7 @@ class EtherealVWAPStrategy:
         if self.cfg.ticker not in products:
             raise RuntimeError(f"Unknown ticker {self.cfg.ticker}. Available: {', '.join(sorted(products.keys()))}")
         p = products[self.cfg.ticker]
-        self.product_id = str(p.id)
+        self.product_id = p.id
         self.product_tick_size = _as_decimal(getattr(p, "tickSize", "0") or "0")
         self.product_lot_size = _as_decimal(getattr(p, "lotSize", "0") or "0")
 
@@ -216,7 +217,7 @@ class EtherealVWAPStrategy:
             limit = 200
         limit = min(limit, 200)
         params: Dict[str, Any] = {
-            "productId": self.product_id,
+            "productId": str(self.product_id),
             "order": "desc",
             "orderBy": "createdAt",
             "limit": limit,
@@ -298,7 +299,7 @@ class EtherealVWAPStrategy:
     # ---------------------------
     async def get_oracle_price(self) -> Decimal:
         assert self.product_id is not None
-        prices = await self.client.list_market_prices(product_ids=[self.product_id])
+        prices = await self.client.list_market_prices(product_ids=[str(self.product_id)])
         if not prices:
             return Decimal("NaN")
         p = prices[0]
@@ -337,7 +338,7 @@ class EtherealVWAPStrategy:
         assert self.subaccount_id is not None and self.product_id is not None
         positions = await self.client.list_positions(
             subaccount_id=self.subaccount_id,
-            product_ids=[self.product_id],
+            product_ids=[str(self.product_id)],
             open=True,
         )
         if not positions:
@@ -382,6 +383,7 @@ class EtherealVWAPStrategy:
         cid = f"{self.client_prefix}_E_{int(time.time() * 1000)}"
 
         try:
+            sender = getattr(getattr(self.client, "chain", None), "address", None)
             o = await self.client.create_order(
                 order_type="LIMIT",
                 product_id=self.product_id,
@@ -392,6 +394,7 @@ class EtherealVWAPStrategy:
                 post_only=bool(self.cfg.post_only),
                 time_in_force="GTD",
                 client_order_id=cid,
+                sender=sender,
                 subaccount=self.subaccount_name,
             )
             oid = str(getattr(o, "id"))
@@ -400,7 +403,7 @@ class EtherealVWAPStrategy:
             self._save_state()
             logger.info("ENTRY placed: %s qty=%s px=%s (order_id=%s)", self.direction, qty, entry_px, oid)
         except Exception as e:
-            logger.error("Failed to place ENTRY: %s", e)
+            logger.error("Failed to place ENTRY: %r", e)
 
     async def _ensure_oco_exits(self, pos: dict, tp_px: Decimal, sl_px: Decimal) -> None:
         if self.state.get("exit_order_ids"):
@@ -420,6 +423,7 @@ class EtherealVWAPStrategy:
 
         # stop_type: 0=GAIN (TP), 1=LOSS (SL)
         try:
+            sender = getattr(getattr(self.client, "chain", None), "address", None)
             order_type = "MARKET" if self.cfg.exits_as_stop_market else "LIMIT"
             tp = await self.client.create_order(
                 order_type=order_type,
@@ -435,6 +439,7 @@ class EtherealVWAPStrategy:
                 client_order_id=_mk("TP"),
                 group_id=group_id,
                 group_contingency_type=1,  # OCO
+                sender=sender,
                 subaccount=self.subaccount_name,
             )
             sl = await self.client.create_order(
@@ -451,6 +456,7 @@ class EtherealVWAPStrategy:
                 client_order_id=_mk("SL"),
                 group_id=group_id,
                 group_contingency_type=1,  # OCO
+                sender=sender,
                 subaccount=self.subaccount_name,
             )
             tp_id = str(getattr(tp, "id"))
@@ -616,7 +622,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
             entry_distance_short_pct=_as_decimal(raw.get("entry_distance_short_pct", "1.5")),
             entry_quantity=_as_decimal(raw.get("entry_quantity", "0.001")),
             post_only=bool(raw.get("post_only", True)),
-            tp_pct=_as_decimal(raw.get("tp_pct", "0")),
+            tp_pct=_as_decimal(raw.get("tp_pct", "1.5")),
             sl_pct=_as_decimal(raw.get("sl_pct", "4.0")),
             exits_as_stop_market=bool(raw.get("exits_as_stop_market", True)),
             pause_on_sl=bool(raw.get("pause_on_sl", False)),
