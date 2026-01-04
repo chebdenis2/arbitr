@@ -398,6 +398,70 @@ class EtherealVWAPStrategy:
         except Exception:
             return None
 
+    async def _adopt_existing_entry_if_any(self, side: int) -> bool:
+        """If there is already a working entry LIMIT for this product+side, adopt it into state."""
+        if not self.subaccount_id or not self.product_id:
+            return False
+        try:
+            orders = await self.client.list_orders(
+                subaccount_id=str(self.subaccount_id),
+                product_ids=[str(self.product_id)],
+                is_working=True,
+                side=side,
+                limit=200,
+                order="desc",
+                order_by="createdAt",
+            )
+        except Exception:
+            return False
+
+        candidates = []
+        for o in orders or []:
+            try:
+                otype = getattr(o, "type", None)
+                otype_val = str(getattr(otype, "value", otype) or "").upper()
+                if otype_val != "LIMIT":
+                    continue
+                if bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False)):
+                    continue
+                if bool(getattr(o, "close", False)):
+                    continue
+                stop_price = str(getattr(o, "stop_price", "") or getattr(o, "stopPrice", "") or "")
+                if stop_price and stop_price not in {"0", "0.0", "0.00", "0.000", "0.0000", "0.000000000"}:
+                    continue
+                candidates.append(o)
+            except Exception:
+                continue
+
+        if not candidates:
+            return False
+
+        # Adopt the newest
+        newest = sorted(candidates, key=lambda x: getattr(x, "created_at", 0) or getattr(x, "createdAt", 0) or 0)[-1]
+        oid = str(getattr(newest, "id", "") or "")
+        cid = str(getattr(newest, "client_order_id", "") or getattr(newest, "clientOrderId", "") or "")
+        if oid:
+            self.state["entry_order_id"] = oid
+            self.state["entry_client_order_id"] = cid or None
+            self._save_state()
+            if len(candidates) > 1:
+                logger.warning("Found %d existing entry orders; adopting latest id=%s (no new orders will be placed).", len(candidates), oid)
+            else:
+                logger.info("Adopted existing entry order id=%s (no new order placed).", oid)
+            return True
+        return False
+
+    @staticmethod
+    def _result_value(x: Any) -> str:
+        """Normalize SDK enum/string results (e.g. Result.ok -> 'Ok')."""
+        try:
+            v = getattr(x, "value", None)
+            if v is not None:
+                return str(v)
+        except Exception:
+            pass
+        return str(x or "")
+
     async def _debug_linked_signers(self) -> None:
         """Optional helper: prints linked signers (does not affect trading)."""
         if not self.subaccount_id:
@@ -427,13 +491,28 @@ class EtherealVWAPStrategy:
         return cid[:32]
 
     async def _ensure_entry_order(self, entry_px: Decimal) -> None:
-        if self.state.get("entry_order_id"):
-            return
+        existing_oid = self.state.get("entry_order_id")
+        if existing_oid:
+            st = await self._confirm_order_status(str(existing_oid))
+            # If we can't confirm yet, assume it's still propagating.
+            if st in {None, "", "NEW", "PENDING", "FILLED_PARTIAL"}:
+                return
+            # If order is no longer working, clear and allow re-placement.
+            if st in {"CANCELED", "EXPIRED", "REJECTED", "FILLED"}:
+                self.state["entry_order_id"] = None
+                self.state["entry_client_order_id"] = None
+                self._save_state()
         qty = self._round_qty(self.cfg.entry_quantity)
         if qty <= 0 or entry_px <= 0:
             return
 
         side = 0 if self.direction == "LONG" else 1
+
+        # If state lost the order id, but UI/API still has a working entry order, adopt it to avoid duplicating.
+        if not self.state.get("entry_order_id"):
+            adopted = await self._adopt_existing_entry_if_any(side)
+            if adopted:
+                return
         cid = self._mk_client_order_id("E")
 
         try:
@@ -454,11 +533,11 @@ class EtherealVWAPStrategy:
                 subaccount=self.subaccount_name,
             )
             oid = str(getattr(o, "id", "") or "")
-            result = str(getattr(o, "result", "") or "")
+            result = self._result_value(getattr(o, "result", "") or "")
             filled = str(getattr(o, "filled", "") or "")
 
             # Important: API can return an id even when result != Ok (e.g. InsufficientBalance, PostOnly reject, etc.)
-            if result and result != "Ok":
+            if result and result.strip().lower() != "ok":
                 logger.error(
                     "ENTRY rejected by API: result=%s filled=%s (qty=%s px=%s)",
                     result,
