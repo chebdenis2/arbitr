@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="utf-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+			<url>
+				<loc>https://docs.ethereal.trade</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-11-27T04:48:49.886Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/introduction/ethereal-mainnet-rollout</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-10-20T05:50:04.915Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-11-27T17:23:14.129Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/margining</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-06-20T03:42:55.193Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/fees</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-11-17T22:47:36.721Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/order-types</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-08-21T05:47:04.782Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/positions</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-10-18T22:10:02.144Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/funding-rates</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-11-27T06:31:32.676Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/market-specifications</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-10-18T22:12:52.818Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/liquidations</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-06-20T11:44:57.785Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/auto-deleveraging</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-06-20T12:53:46.135Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/subaccounts</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-06-20T11:44:31.948Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/price-oracles</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-06-20T11:44:32.330Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/referrals</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-11-27T07:23:06.741Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/perpetual-futures/ethereal-testnet</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-12-17T05:23:24.570Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/usde-balance-rewards</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-12-18T23:25:51.211Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/trading/usde-trading-rewards</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-12-24T19:22:43.262Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/points/ethereal-points</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-11-17T22:57:09.857Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-06-20T12:36:06.180Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/quick-start</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-06-20T10:35:38.882Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/message-signing</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-12-16T07:53:05.246Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/accounts-and-signers</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-11-27T06:51:00.678Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/order-placement</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-06-20T11:24:10.548Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/system-limits</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-12-16T08:22:31.784Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/products</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-10-20T01:57:08.149Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/token-transfers</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-11-27T04:50:48.433Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/supported-tokens</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-11-27T04:50:48.433Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/trading-api/websocket-gateway</loc>
+				<priority>0.7</priority>
+				<lastmod>2025-11-27T04:45:22.056Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/developer-guides/python-sdk</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-04-06T06:42:23.226Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/protocol-reference/api-hosts</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-11-27T06:41:45.467Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/protocol-reference/contracts</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-10-30T01:50:34.948Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/protocol-reference/audits</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-06-20T04:05:38.490Z</lastmod>
+</url>
+
+			<url>
+				<loc>https://docs.ethereal.trade/protocol-reference/media-kit</loc>
+				<priority>0.84</priority>
+				<lastmod>2025-10-20T01:13:40.262Z</lastmod>
+</url>
+
+
+</urlset>
