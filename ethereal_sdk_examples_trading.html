@@ -1,0 +1,1490 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Python SDK for interacting with the Ethereal DEX">
+      
+      
+      
+      
+        <link rel="prev" href="../market_data/">
+      
+      
+        <link rel="next" href="../account_management/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.0">
+    
+    
+      
+        <title>Trading - Ethereal Python SDK</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.618322db.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/_mkdocstrings.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#trading-examples" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Ethereal Python SDK" class="md-header__button md-logo" aria-label="Ethereal Python SDK" data-md-component="logo">
+      
+  <img src="../../images/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Ethereal Python SDK
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Trading
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../guides/installation/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../market_data/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Examples
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../reference/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  API Reference
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Ethereal Python SDK" class="md-nav__button md-logo" aria-label="Ethereal Python SDK" data-md-component="logo">
+      
+  <img src="../../images/logo.svg" alt="logo">
+
+    </a>
+    Ethereal Python SDK
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/quickstart/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quickstart
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/best_practices/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Best Practices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/websockets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    WebSockets
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/advanced_usage/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Advanced Usage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/async_migration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Async Migration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/link_signers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Link Signers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Examples
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market_data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Market Data
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Trading
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Trading
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setup
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#creating-orders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Creating orders
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#managing-orders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Managing orders
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#order-fills-and-trade-history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Order fills and trade history
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#advanced-orders-stops-oto-oco" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Advanced Orders: Stops, OTO &amp; OCO
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Advanced Orders: Stops, OTO &amp; OCO">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#stop-orders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stop orders
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#one-triggers-other-and-one-cancels-other-otooco" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One-Triggers-Other and One-Cancels-Other (OTO/OCO)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#oco-take-profit-and-stop-loss-exits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OCO: Take-profit and stop-loss exits
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#oto-scale-out-multiple-profit-targets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OTO Scale-out: Multiple Profit Targets
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bracket-order-entry-oco-exits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bracket Order: Entry + OCO Exits
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../account_management/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Account Management
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../signatures/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Message Signing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setup
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#creating-orders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Creating orders
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#managing-orders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Managing orders
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#order-fills-and-trade-history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Order fills and trade history
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#advanced-orders-stops-oto-oco" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Advanced Orders: Stops, OTO &amp; OCO
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Advanced Orders: Stops, OTO &amp; OCO">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#stop-orders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stop orders
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#one-triggers-other-and-one-cancels-other-otooco" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One-Triggers-Other and One-Cancels-Other (OTO/OCO)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#oco-take-profit-and-stop-loss-exits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OCO: Take-profit and stop-loss exits
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#oto-scale-out-multiple-profit-targets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OTO Scale-out: Multiple Profit Targets
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bracket-order-entry-oco-exits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bracket Order: Entry + OCO Exits
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<h1 id="trading-examples">Trading Examples<a class="headerlink" href="#trading-examples" title="Permanent link">&para;</a></h1>
+<p>This page provides examples of trading operations with the Ethereal Python SDK.</p>
+<h2 id="setup">Setup<a class="headerlink" href="#setup" title="Permanent link">&para;</a></h2>
+<p>All examples on this page use the <code>AsyncRESTClient</code>. Here's the basic pattern used throughout:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">decimal</span><span class="w"> </span><span class="kn">import</span> <span class="n">Decimal</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">ethereal</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncRESTClient</span>
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="c1"># Initialize client</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="k">await</span> <span class="n">AsyncRESTClient</span><span class="o">.</span><span class="n">create</span><span class="p">({</span>
+        <span class="s2">&quot;base_url&quot;</span><span class="p">:</span> <span class="s2">&quot;https://api.ethereal.trade&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;chain_config&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;rpc_url&quot;</span><span class="p">:</span> <span class="s2">&quot;https://rpc.ethereal.trade&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;private_key&quot;</span><span class="p">:</span> <span class="s2">&quot;your_private_key&quot;</span>
+        <span class="p">}</span>
+    <span class="p">})</span>
+
+    <span class="c1"># Your code here</span>
+
+    <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+<span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div>
+<p>The examples below show the code that goes in the "Your code here" section. For a complete standalone example, see <a href="#creating-orders">Creating orders</a>.</p>
+<h2 id="creating-orders">Creating orders<a class="headerlink" href="#creating-orders" title="Permanent link">&para;</a></h2>
+<p>This complete example shows the full pattern including imports, initialization, and cleanup:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">decimal</span><span class="w"> </span><span class="kn">import</span> <span class="n">Decimal</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">ethereal</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncRESTClient</span>
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_orders</span><span class="p">():</span>
+    <span class="c1"># Initialize client with your private key</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="k">await</span> <span class="n">AsyncRESTClient</span><span class="o">.</span><span class="n">create</span><span class="p">({</span>
+        <span class="s2">&quot;base_url&quot;</span><span class="p">:</span> <span class="s2">&quot;https://api.ethereal.trade&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;chain_config&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;rpc_url&quot;</span><span class="p">:</span> <span class="s2">&quot;https://rpc.ethereal.trade&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;private_key&quot;</span><span class="p">:</span> <span class="s2">&quot;your_private_key&quot;</span>
+        <span class="p">}</span>
+    <span class="p">})</span>
+
+    <span class="c1"># Place a limit buy order</span>
+    <span class="n">limit_buy</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+        <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+        <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.01&quot;</span><span class="p">),</span>  <span class="c1"># Buy 0.01 BTC</span>
+        <span class="n">side</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>         <span class="c1"># 0 for buy</span>
+        <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;80000&quot;</span><span class="p">),</span>  <span class="c1"># Price in USD</span>
+        <span class="n">ticker</span><span class="o">=</span><span class="s2">&quot;BTCUSD&quot;</span><span class="p">,</span>
+        <span class="n">time_in_force</span><span class="o">=</span><span class="s2">&quot;GTD&quot;</span><span class="p">,</span>  <span class="c1"># Good Til Date</span>
+        <span class="n">post_only</span><span class="o">=</span><span class="kc">True</span>
+    <span class="p">)</span>
+
+    <span class="c1"># Place a limit sell order</span>
+    <span class="n">limit_sell</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+        <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span>
+        <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.01&quot;</span><span class="p">),</span> <span class="c1"># Sell 0.01 BTC</span>
+        <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>        <span class="c1"># 1 for sell</span>
+        <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;85000&quot;</span><span class="p">),</span> <span class="c1"># Price in USD</span>
+        <span class="n">ticker</span><span class="o">=</span><span class="s2">&quot;BTCUSD&quot;</span>
+    <span class="p">)</span>
+
+    <span class="c1"># Place a market buy order</span>
+    <span class="n">market_buy</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+        <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span>
+        <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.01&quot;</span><span class="p">),</span>  <span class="c1"># Buy 0.01 BTC</span>
+        <span class="n">side</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>         <span class="c1"># 0 for buy</span>
+        <span class="n">ticker</span><span class="o">=</span><span class="s2">&quot;BTCUSD&quot;</span>
+    <span class="p">)</span>
+
+    <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">limit_buy</span><span class="p">,</span> <span class="n">limit_sell</span><span class="p">,</span> <span class="n">market_buy</span>
+
+<span class="c1"># Run the async function</span>
+<span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">create_orders</span><span class="p">())</span>
+</code></pre></div>
+<h2 id="managing-orders">Managing orders<a class="headerlink" href="#managing-orders" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># Get all orders</span>
+<span class="n">subaccounts</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">subaccounts</span><span class="p">()</span>
+<span class="n">sid</span> <span class="o">=</span> <span class="n">subaccounts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>
+<span class="n">sname</span> <span class="o">=</span> <span class="n">subaccounts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">name</span>
+<span class="n">orders</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">list_orders</span><span class="p">(</span><span class="n">subaccount_id</span><span class="o">=</span><span class="n">sid</span><span class="p">)</span>
+
+<span class="c1"># Get orders for a specific product</span>
+<span class="n">products_by_ticker</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">products_by_ticker</span><span class="p">()</span>
+<span class="n">btc_product_id</span> <span class="o">=</span> <span class="n">products_by_ticker</span><span class="p">[</span><span class="s2">&quot;BTCUSD&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>
+<span class="n">btc_orders</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">list_orders</span><span class="p">(</span><span class="n">subaccount_id</span><span class="o">=</span><span class="n">sid</span><span class="p">,</span> <span class="n">product_ids</span><span class="o">=</span><span class="p">[</span><span class="n">btc_product_id</span><span class="p">])</span>
+
+<span class="c1"># Get a specific order by ID</span>
+<span class="n">order_id</span> <span class="o">=</span> <span class="s1">&#39;78231588-f2a4-47b9-9b96-9ff8ed58d034&#39;</span>
+<span class="n">order</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">get_order</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">order_id</span><span class="p">)</span>
+
+<span class="c1"># Cancel an order</span>
+<span class="n">cancel_results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">cancel_orders</span><span class="p">(</span>
+    <span class="n">order_ids</span><span class="o">=</span><span class="p">[</span><span class="n">order_id</span><span class="p">],</span>
+    <span class="n">sender</span><span class="o">=</span><span class="n">client</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">address</span><span class="p">,</span>
+    <span class="n">subaccount</span><span class="o">=</span><span class="n">sname</span>
+<span class="p">)</span>
+</code></pre></div>
+<h2 id="order-fills-and-trade-history">Order fills and trade history<a class="headerlink" href="#order-fills-and-trade-history" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># Get trade history</span>
+<span class="n">subaccounts</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">subaccounts</span><span class="p">()</span>
+<span class="n">sid</span> <span class="o">=</span> <span class="n">subaccounts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>
+<span class="n">trades</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">list_trades</span><span class="p">(</span><span class="n">subaccount_id</span><span class="o">=</span><span class="n">sid</span><span class="p">)</span>
+
+<span class="c1"># Get fills</span>
+<span class="n">fills</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">list_fills</span><span class="p">(</span><span class="n">subaccount_id</span><span class="o">=</span><span class="n">sid</span><span class="p">)</span>
+
+<span class="c1"># Get all fills for a product</span>
+<span class="n">products_by_ticker</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">products_by_ticker</span><span class="p">()</span>
+<span class="n">btc_product_id</span> <span class="o">=</span> <span class="n">products_by_ticker</span><span class="p">[</span><span class="s1">&#39;BTCUSD&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>
+<span class="n">btc_fills</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">list_fills</span><span class="p">(</span><span class="n">subaccount_id</span><span class="o">=</span><span class="n">sid</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">btc_product_id</span><span class="p">)</span>
+
+<span class="c1"># Display fill information</span>
+<span class="k">for</span> <span class="n">fill</span> <span class="ow">in</span> <span class="n">fills</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">fill</span><span class="o">.</span><span class="n">model_dump</span><span class="p">())</span>
+</code></pre></div>
+<h2 id="advanced-orders-stops-oto-oco">Advanced Orders: Stops, OTO &amp; OCO<a class="headerlink" href="#advanced-orders-stops-oto-oco" title="Permanent link">&para;</a></h2>
+<h3 id="stop-orders">Stop orders<a class="headerlink" href="#stop-orders" title="Permanent link">&para;</a></h3>
+<p><strong>What they are.</strong> A stop becomes active when the oracle crosses the <code>stop_price</code>:</p>
+<ul>
+<li><strong>Stop-market:</strong> executes at market when triggered ⇒ set <code>order_type="MARKET"</code>.</li>
+<li><strong>Stop-limit:</strong> when triggered, places a limit at <code>price</code> ⇒ set <code>order_type="LIMIT"</code> and include both <code>stop_price</code> and <code>price</code>.</li>
+<li><code>stop_type</code>: <code>0 = GAIN</code> (take-profit), <code>1 = LOSS</code> (stop-loss).</li>
+<li>Use <code>reduce_only=True</code> on exits so you don't increase position size.</li>
+</ul>
+<p><strong>Stop-market (long position: take-profit &amp; stop-loss)</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Assuming a long position opened at $1000</span>
+<span class="c1"># Define the product and quantity for the examples</span>
+<span class="n">products_by_ticker</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">products_by_ticker</span><span class="p">()</span>
+<span class="n">pid</span> <span class="o">=</span> <span class="n">products_by_ticker</span><span class="p">[</span><span class="s2">&quot;BTCUSD&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>  <span class="c1"># Product ID</span>
+<span class="n">qty</span> <span class="o">=</span> <span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.01&quot;</span><span class="p">)</span>  <span class="c1"># Quantity to close</span>
+
+<span class="c1"># Take-profit (GAIN): triggers at or above stop_price</span>
+<span class="c1"># Closes the position in profit if the price reaches 1050</span>
+<span class="n">tp</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">qty</span><span class="p">,</span>
+    <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">stop_type</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">stop_price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1050&quot;</span><span class="p">),</span>
+<span class="p">)</span>
+
+<span class="c1"># Stop-loss (LOSS): triggers at or below stop_price</span>
+<span class="c1"># Closes the position at a loss if the price reaches 900</span>
+<span class="n">sl</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">qty</span><span class="p">,</span>
+    <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">stop_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">stop_price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;900&quot;</span><span class="p">),</span>
+<span class="p">)</span>
+</code></pre></div>
+<p><strong>Stop-limit (long position exits)</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Assuming a long position opened at $1000</span>
+<span class="c1"># Define the product and quantity for the examples</span>
+<span class="n">products_by_ticker</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">products_by_ticker</span><span class="p">()</span>
+<span class="n">pid</span> <span class="o">=</span> <span class="n">products_by_ticker</span><span class="p">[</span><span class="s2">&quot;BTCUSD&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>  <span class="c1"># Product ID</span>
+<span class="n">qty</span> <span class="o">=</span> <span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.01&quot;</span><span class="p">)</span>  <span class="c1"># Quantity to close</span>
+
+<span class="c1"># Stop-limit take-profit: trigger a limit order</span>
+<span class="c1"># Creates a limit order at 1050 if the price reaches 1050</span>
+<span class="n">tp_limit</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">qty</span><span class="p">,</span> <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">stop_type</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">stop_price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1050&quot;</span><span class="p">),</span>
+    <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1050&quot;</span><span class="p">),</span>  <span class="c1"># limit after trigger</span>
+<span class="p">)</span>
+
+<span class="c1"># Stop-limit stop-loss: trigger a limit order</span>
+<span class="c1"># Creates a limit order at 899 if the price reaches 900</span>
+<span class="n">sl_limit</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">qty</span><span class="p">,</span> <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">stop_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">stop_price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;900&quot;</span><span class="p">),</span>
+    <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;899&quot;</span><span class="p">),</span>
+<span class="p">)</span>
+</code></pre></div>
+<h3 id="one-triggers-other-and-one-cancels-other-otooco">One-Triggers-Other and One-Cancels-Other (OTO/OCO)<a class="headerlink" href="#one-triggers-other-and-one-cancels-other-otooco" title="Permanent link">&para;</a></h3>
+<p>Orders with a <code>group_id</code> and <code>group_contingency_type</code> are linked and will be triggered accordingly. You can provide any UUID as a <code>group_id</code> in order to easily manage related orders. Group contingency type has two values:</p>
+<ul>
+<li><strong>OTO (One-Triggers-Other)</strong> → <code>group_contingency_type=0</code> <strong>on the primary order only</strong>. Secondary orders share a <code>group_id</code> and <strong>omit</strong> <code>group_contingency_type</code>. Secondaries activate <strong>after the primary order fills</strong>.</li>
+<li><strong>OCO (One-Cancels-Other)</strong> → every order in the group sets <code>group_contingency_type=1</code>. When one fills/cancels, all orders in the group are <strong>auto-canceled</strong>.</li>
+</ul>
+<p><strong>Important limitations:</strong></p>
+<ul>
+<li>Only <strong>one</strong> OTO trigger order is allowed per group</li>
+<li>Cannot mix OTO and OCO contingency types within the same group</li>
+<li>Groups are isolated per subaccount (same UUID can be reused across different subaccounts)</li>
+</ul>
+<h3 id="oco-take-profit-and-stop-loss-exits">OCO: Take-profit and stop-loss exits<a class="headerlink" href="#oco-take-profit-and-stop-loss-exits" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
+
+<span class="c1"># Assume a long position opened at $1000</span>
+<span class="c1"># Define the product for the examples</span>
+<span class="n">products_by_ticker</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">products_by_ticker</span><span class="p">()</span>
+<span class="n">pid</span> <span class="o">=</span> <span class="n">products_by_ticker</span><span class="p">[</span><span class="s2">&quot;BTCUSD&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>  <span class="c1"># Product ID</span>
+
+<span class="n">group_id</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">())</span>
+
+<span class="n">tp</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.001&quot;</span><span class="p">),</span>
+    <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1050&quot;</span><span class="p">),</span>
+    <span class="n">time_in_force</span><span class="o">=</span><span class="s2">&quot;GTD&quot;</span><span class="p">,</span> <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">stop_type</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">stop_price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1050&quot;</span><span class="p">),</span>
+    <span class="n">group_id</span><span class="o">=</span><span class="n">group_id</span><span class="p">,</span> <span class="n">group_contingency_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># OCO</span>
+<span class="p">)</span>
+
+<span class="n">sl</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.001&quot;</span><span class="p">),</span>
+    <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;899&quot;</span><span class="p">),</span>
+    <span class="n">time_in_force</span><span class="o">=</span><span class="s2">&quot;GTD&quot;</span><span class="p">,</span> <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">stop_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">stop_price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;900&quot;</span><span class="p">),</span>
+    <span class="n">group_id</span><span class="o">=</span><span class="n">group_id</span><span class="p">,</span> <span class="n">group_contingency_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># OCO</span>
+<span class="p">)</span>
+</code></pre></div>
+<h3 id="oto-scale-out-multiple-profit-targets">OTO Scale-out: Multiple Profit Targets<a class="headerlink" href="#oto-scale-out-multiple-profit-targets" title="Permanent link">&para;</a></h3>
+<p>Entry order triggers multiple exit orders at different price levels, useful for scaling out of positions.</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
+
+<span class="c1"># Define the product for the examples</span>
+<span class="n">products_by_ticker</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">products_by_ticker</span><span class="p">()</span>
+<span class="n">pid</span> <span class="o">=</span> <span class="n">products_by_ticker</span><span class="p">[</span><span class="s2">&quot;BTCUSD&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>  <span class="c1"># Product ID</span>
+
+<span class="n">group_id</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">())</span>
+
+<span class="c1"># Entry order (must fill first)</span>
+<span class="n">entry</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.003&quot;</span><span class="p">),</span>
+    <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1000&quot;</span><span class="p">),</span>
+    <span class="n">time_in_force</span><span class="o">=</span><span class="s2">&quot;GTD&quot;</span><span class="p">,</span>
+    <span class="n">group_id</span><span class="o">=</span><span class="n">group_id</span><span class="p">,</span> <span class="n">group_contingency_type</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>  <span class="c1"># OTO</span>
+<span class="p">)</span>
+
+<span class="c1"># Scale out at different profit levels (all triggered when entry fills)</span>
+<span class="n">exits</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="n">exit_price</span> <span class="ow">in</span> <span class="p">[</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1050&quot;</span><span class="p">),</span> <span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1100&quot;</span><span class="p">),</span> <span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1150&quot;</span><span class="p">)]:</span>
+    <span class="n">exit_order</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+        <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.001&quot;</span><span class="p">),</span>
+        <span class="n">price</span><span class="o">=</span><span class="n">exit_price</span><span class="p">,</span>
+        <span class="n">time_in_force</span><span class="o">=</span><span class="s2">&quot;GTD&quot;</span><span class="p">,</span> <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">group_id</span><span class="o">=</span><span class="n">group_id</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">exits</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">exit_order</span><span class="p">)</span>
+</code></pre></div>
+<h3 id="bracket-order-entry-oco-exits">Bracket Order: Entry + OCO Exits<a class="headerlink" href="#bracket-order-entry-oco-exits" title="Permanent link">&para;</a></h3>
+<p>For a bracket where take-profit and stop-loss cancel each other, first enter the position with a market order, then create OCO exit orders.</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
+
+<span class="c1"># Define the product for the examples</span>
+<span class="n">products_by_ticker</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">products_by_ticker</span><span class="p">()</span>
+<span class="n">pid</span> <span class="o">=</span> <span class="n">products_by_ticker</span><span class="p">[</span><span class="s2">&quot;BTCUSD&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">id</span>  <span class="c1"># Product ID</span>
+
+<span class="c1"># 1) Enter position immediately</span>
+<span class="n">entry</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.002&quot;</span><span class="p">),</span>
+<span class="p">)</span>
+
+<span class="c1"># 2) Set up OCO exits that cancel each other</span>
+<span class="n">exit_group</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">())</span>
+
+<span class="n">tp</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;LIMIT&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.002&quot;</span><span class="p">),</span>
+    <span class="n">price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;1050&quot;</span><span class="p">),</span> <span class="n">time_in_force</span><span class="o">=</span><span class="s2">&quot;GTD&quot;</span><span class="p">,</span> <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">group_id</span><span class="o">=</span><span class="n">exit_group</span><span class="p">,</span> <span class="n">group_contingency_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># OCO</span>
+<span class="p">)</span>
+
+<span class="n">sl</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">create_order</span><span class="p">(</span>
+    <span class="n">order_type</span><span class="o">=</span><span class="s2">&quot;MARKET&quot;</span><span class="p">,</span> <span class="n">product_id</span><span class="o">=</span><span class="n">pid</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">quantity</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;0.002&quot;</span><span class="p">),</span>
+    <span class="n">stop_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">stop_price</span><span class="o">=</span><span class="n">Decimal</span><span class="p">(</span><span class="s2">&quot;900&quot;</span><span class="p">),</span> <span class="n">reduce_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">group_id</span><span class="o">=</span><span class="n">exit_group</span><span class="p">,</span> <span class="n">group_contingency_type</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># OCO</span>
+<span class="p">)</span>
+</code></pre></div>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../market_data/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Market Data">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Market Data
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../account_management/" class="md-footer__link md-footer__link--next" aria-label="Next: Account Management">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Account Management
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tabs", "navigation.tabs.sticky", "navigation.footer", "navigation.indexes", "content.tabs.link", "content.code.copy"], "search": "../../assets/javascripts/workers/search.7a47a382.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.e71a0d61.min.js"></script>
+      
+    
+  </body>
+</html>
