@@ -59,11 +59,13 @@ class StrategyConfig:
     entry_distance_short_pct: Decimal = Decimal("1.5")  # % from VWAP for SHORT
     entry_quantity: Decimal = Decimal("0.001")  # base asset qty
     post_only: bool = True
+    entry_expires_in_sec: int = 7 * 24 * 3600  # GTD expiry (seconds)
 
     # One exit "bracket" (OCO TP+SL)
     tp_pct: Decimal = Decimal("1.5")  # % from VWAP
     sl_pct: Decimal = Decimal("4.0")  # % from VWAP
     exits_as_stop_market: bool = True
+    exit_expires_in_sec: int = 7 * 24 * 3600  # GTD expiry (seconds)
 
     # Safety
     pause_on_sl: bool = False
@@ -388,6 +390,14 @@ class EtherealVWAPStrategy:
         self.state["exit_orders"] = {"tp": None, "sl": None}
         self.state["exit_group_id"] = None
 
+    async def _confirm_order_status(self, order_id: str) -> Optional[str]:
+        """Fetch order by id and return status (upper)."""
+        try:
+            o = await self.client.get_order(id=UUID(order_id))
+            return (getattr(o, "status", "") or "").upper()
+        except Exception:
+            return None
+
     async def _debug_linked_signers(self) -> None:
         """Optional helper: prints linked signers (does not affect trading)."""
         if not self.subaccount_id:
@@ -428,6 +438,7 @@ class EtherealVWAPStrategy:
 
         try:
             sender = getattr(getattr(self.client, "chain", None), "address", None)
+            expires_at = int(time.time()) + int(self.cfg.entry_expires_in_sec)
             o = await self.client.create_order(
                 order_type="LIMIT",
                 product_id=self.product_id,
@@ -437,15 +448,53 @@ class EtherealVWAPStrategy:
                 price=float(entry_px),
                 post_only=bool(self.cfg.post_only),
                 time_in_force="GTD",
+                expires_at=expires_at,
                 client_order_id=cid,
                 sender=sender,
                 subaccount=self.subaccount_name,
             )
-            oid = str(getattr(o, "id"))
+            oid = str(getattr(o, "id", "") or "")
+            result = str(getattr(o, "result", "") or "")
+            filled = str(getattr(o, "filled", "") or "")
+
+            # Important: API can return an id even when result != Ok (e.g. InsufficientBalance, PostOnly reject, etc.)
+            if result and result != "Ok":
+                logger.error(
+                    "ENTRY rejected by API: result=%s filled=%s (qty=%s px=%s)",
+                    result,
+                    filled,
+                    qty,
+                    entry_px,
+                )
+                return
+            if not oid:
+                logger.error("ENTRY submit returned empty order id (result=%s)", result or "UNKNOWN")
+                return
+
+            status = await self._confirm_order_status(oid)
+            if status in {"REJECTED", "CANCELED", "EXPIRED"}:
+                logger.error(
+                    "ENTRY not working after submit: status=%s (order_id=%s result=%s filled=%s)",
+                    status,
+                    oid,
+                    result or "UNKNOWN",
+                    filled or "0",
+                )
+                return
+
             self.state["entry_order_id"] = oid
             self.state["entry_client_order_id"] = cid
             self._save_state()
-            logger.info("ENTRY placed: %s qty=%s px=%s (order_id=%s)", self.direction, qty, entry_px, oid)
+            logger.info(
+                "ENTRY placed: %s qty=%s px=%s (order_id=%s status=%s result=%s filled=%s)",
+                self.direction,
+                qty,
+                entry_px,
+                oid,
+                status or "UNKNOWN",
+                result or "UNKNOWN",
+                filled or "0",
+            )
         except Exception as e:
             logger.error("Failed to place ENTRY: %r", e)
             if "401" in str(e) or "Unauthorized" in str(e):
@@ -471,6 +520,7 @@ class EtherealVWAPStrategy:
         try:
             sender = getattr(getattr(self.client, "chain", None), "address", None)
             order_type = "MARKET" if self.cfg.exits_as_stop_market else "LIMIT"
+            expires_at = int(time.time()) + int(self.cfg.exit_expires_in_sec)
             tp = await self.client.create_order(
                 order_type=order_type,
                 product_id=self.product_id,
@@ -482,6 +532,7 @@ class EtherealVWAPStrategy:
                 stop_price=float(tp_px),
                 price=(float(tp_px) if order_type == "LIMIT" else None),
                 time_in_force="GTD",
+                expires_at=expires_at,
                 client_order_id=self._mk_client_order_id("TP"),
                 group_id=group_id,
                 group_contingency_type=1,  # OCO
@@ -499,6 +550,7 @@ class EtherealVWAPStrategy:
                 stop_price=float(sl_px),
                 price=(float(sl_px) if order_type == "LIMIT" else None),
                 time_in_force="GTD",
+                expires_at=expires_at,
                 client_order_id=self._mk_client_order_id("SL"),
                 group_id=group_id,
                 group_contingency_type=1,  # OCO
