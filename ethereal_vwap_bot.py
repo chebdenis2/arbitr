@@ -132,10 +132,18 @@ class EtherealVWAPStrategy:
         logger.info(
             "Initialized: ticker=%s product_id=%s subaccount=%s (%s)",
             self.cfg.ticker,
-            self.product_id,
+            str(self.product_id),
             self.subaccount_name,
             self.subaccount_id,
         )
+
+        # Trading endpoints require an ACTIVE linked signer.
+        ok = await self._ensure_signer_active()
+        if not ok:
+            logger.warning(
+                "Signer is not ACTIVE yet for this subaccount. "
+                "Linking signers can take time to finalize onchain; until then trading will return 401."
+            )
 
     # ---------------------------
     # Persistence
@@ -376,6 +384,63 @@ class EtherealVWAPStrategy:
         self.state["exit_orders"] = {"tp": None, "sl": None}
         self.state["exit_group_id"] = None
 
+    async def _ensure_signer_active(self) -> bool:
+        """Ensure current sender address is linked and ACTIVE for this subaccount."""
+        if not self.subaccount_id or not self.subaccount_name:
+            return False
+        sender = getattr(getattr(self.client, "chain", None), "address", None)
+        if not sender:
+            logger.error("No chain address available (sender). Check ETHEREAL_PRIVATE_KEY / chain_config.")
+            return False
+
+        try:
+            signers = await self.client.list_signers(subaccount_id=self.subaccount_id, limit=50)
+        except Exception as e:
+            logger.warning("Could not fetch linked signers: %s", e)
+            signers = []
+
+        for s in signers:
+            if (getattr(s, "signer", "") or "").lower() == sender.lower():
+                status = str(getattr(s, "status", "") or "").upper()
+                if status == "ACTIVE":
+                    return True
+                logger.warning("Linked signer status for %s is %s (need ACTIVE).", sender, status)
+                return False
+
+        # Not linked: attempt to link signer==sender using the same private key for both signatures.
+        try:
+            pk = getattr(getattr(self.client, "chain", None), "private_key", None)
+            if not pk:
+                logger.error("No private key available in chain client (cannot link signer).")
+                return False
+
+            dto = await self.client.prepare_linked_signer(
+                sender=sender,
+                signer=sender,
+                subaccount=self.subaccount_name,
+                subaccount_id=UUID(self.subaccount_id),
+                include_signature=False,
+            )
+            dto = await self.client.sign_linked_signer(dto, signer_private_key=pk, private_key=pk)
+            await self.client.link_linked_signer(dto)
+            logger.info("Submitted link-signer request for %s. Waiting for ACTIVE...", sender)
+        except Exception as e:
+            logger.error("Failed to link signer (may require manual linking in UI): %s", e)
+            return False
+
+        # Re-check status (may still be pending)
+        try:
+            signers = await self.client.list_signers(subaccount_id=self.subaccount_id, limit=50)
+            for s in signers:
+                if (getattr(s, "signer", "") or "").lower() == sender.lower():
+                    status = str(getattr(s, "status", "") or "").upper()
+                    logger.info("Linked signer status after submit: %s", status)
+                    return status == "ACTIVE"
+        except Exception:
+            pass
+
+        return False
+
     def _mk_client_order_id(self, kind: str) -> str:
         """
         Generate a <=32 char client order id.
@@ -422,6 +487,9 @@ class EtherealVWAPStrategy:
             logger.info("ENTRY placed: %s qty=%s px=%s (order_id=%s)", self.direction, qty, entry_px, oid)
         except Exception as e:
             logger.error("Failed to place ENTRY: %r", e)
+            # Common failure: 401 when signer is not linked/ACTIVE.
+            if "401" in str(e) or "Unauthorized" in str(e):
+                await self._ensure_signer_active()
 
     async def _ensure_oco_exits(self, pos: dict, tp_px: Decimal, sl_px: Decimal) -> None:
         if self.state.get("exit_order_ids"):
@@ -678,6 +746,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
 
 async def amain() -> None:
     testnet = (os.getenv("ETHEREAL_TESTNET", "1").strip().lower() in {"1", "true", "y", "yes"})
+    network = "testnet" if testnet else "mainnet"
     base_url = os.getenv("ETHEREAL_BASE_URL") or ("https://api.etherealtest.net" if testnet else "https://api.ethereal.trade")
     rpc_url = os.getenv("ETHEREAL_RPC_URL") or ("https://rpc.etherealtest.net" if testnet else "https://rpc.ethereal.trade")
     private_key = (os.getenv("ETHEREAL_PRIVATE_KEY") or "").strip()
@@ -701,6 +770,7 @@ async def amain() -> None:
 
     client = await AsyncRESTClient.create(
         {
+            "network": network,
             "base_url": base_url,
             "chain_config": {
                 "rpc_url": rpc_url,
