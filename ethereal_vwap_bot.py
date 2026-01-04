@@ -86,7 +86,9 @@ class EtherealVWAPStrategy:
             raise ValueError("direction must be LONG or SHORT")
         self.direction = d
 
-        self.client_prefix = f"VWAP1_{self.direction[0]}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+        # Ethereal constraint: clientOrderId max length is 32 chars.
+        # Keep a short unique prefix and generate compact IDs per order.
+        self.client_prefix = f"V1{self.direction[0]}{uuid.uuid4().hex[:6].upper()}"  # e.g. V1L12ABCD
         self.state_file = f"strategy_state_{self.direction}_{cfg.ticker}.json"
         self.config_file = f"strategy_config_{self.direction}_{cfg.ticker}.json"
 
@@ -151,6 +153,7 @@ class EtherealVWAPStrategy:
         self.state.setdefault("entry_order_id", None)
         self.state.setdefault("entry_client_order_id", None)
         self.state.setdefault("exit_order_ids", [])
+        self.state.setdefault("exit_orders", {"tp": None, "sl": None})
         self.state.setdefault("exit_group_id", None)
         self.state.setdefault("trading_paused", False)
         self.state.setdefault("pause_reason", None)
@@ -370,7 +373,22 @@ class EtherealVWAPStrategy:
         if ids:
             await self._cancel_order_ids(ids)
         self.state["exit_order_ids"] = []
+        self.state["exit_orders"] = {"tp": None, "sl": None}
         self.state["exit_group_id"] = None
+
+    def _mk_client_order_id(self, kind: str) -> str:
+        """
+        Generate a <=32 char client order id.
+        kind: 'E' | 'TP' | 'SL'
+        """
+        kind = (kind or "").upper()
+        if kind not in {"E", "TP", "SL"}:
+            kind = "X"
+        # Use last 9 digits of ms timestamp + 3 random hex chars.
+        ts = int(time.time() * 1000) % 1_000_000_000
+        rnd = uuid.uuid4().hex[:3].upper()
+        cid = f"{self.client_prefix}{kind}{ts:09d}{rnd}"
+        return cid[:32]
 
     async def _ensure_entry_order(self, entry_px: Decimal) -> None:
         if self.state.get("entry_order_id"):
@@ -380,7 +398,7 @@ class EtherealVWAPStrategy:
             return
 
         side = 0 if self.direction == "LONG" else 1
-        cid = f"{self.client_prefix}_E_{int(time.time() * 1000)}"
+        cid = self._mk_client_order_id("E")
 
         try:
             sender = getattr(getattr(self.client, "chain", None), "address", None)
@@ -418,9 +436,6 @@ class EtherealVWAPStrategy:
         exit_side = 1 if self.direction == "LONG" else 0
         group_id = str(uuid.uuid4())
 
-        def _mk(kind: str) -> str:
-            return f"{self.client_prefix}_{kind}_{int(time.time() * 1000)}"
-
         # stop_type: 0=GAIN (TP), 1=LOSS (SL)
         try:
             sender = getattr(getattr(self.client, "chain", None), "address", None)
@@ -436,7 +451,7 @@ class EtherealVWAPStrategy:
                 stop_price=float(tp_px),
                 price=(float(tp_px) if order_type == "LIMIT" else None),
                 time_in_force="GTD",
-                client_order_id=_mk("TP"),
+                client_order_id=self._mk_client_order_id("TP"),
                 group_id=group_id,
                 group_contingency_type=1,  # OCO
                 sender=sender,
@@ -453,7 +468,7 @@ class EtherealVWAPStrategy:
                 stop_price=float(sl_px),
                 price=(float(sl_px) if order_type == "LIMIT" else None),
                 time_in_force="GTD",
-                client_order_id=_mk("SL"),
+                client_order_id=self._mk_client_order_id("SL"),
                 group_id=group_id,
                 group_contingency_type=1,  # OCO
                 sender=sender,
@@ -462,6 +477,7 @@ class EtherealVWAPStrategy:
             tp_id = str(getattr(tp, "id"))
             sl_id = str(getattr(sl, "id"))
             self.state["exit_order_ids"] = [tp_id, sl_id]
+            self.state["exit_orders"] = {"tp": tp_id, "sl": sl_id}
             self.state["exit_group_id"] = group_id
             self._save_state()
             logger.info("EXITS placed (OCO): TP=%s SL=%s qty=%s group=%s", tp_px, sl_px, qty, group_id)
@@ -473,22 +489,21 @@ class EtherealVWAPStrategy:
         if not exit_ids:
             return None
         try:
-            filled = {}
+            filled: dict[str, str] = {}
             for oid in exit_ids:
                 o = await self.client.get_order(id=oid)
                 status = (getattr(o, "status", "") or "").upper()
                 filled[oid] = status
-            # Prefer FILLED over others
             for oid, st in filled.items():
-                if st == "FILLED":
-                    # Infer from clientOrderId if possible
-                    o = await self.client.get_order(id=oid)
-                    cid = (getattr(o, "clientOrderId", "") or "")
-                    if "_SL_" in cid:
-                        return "SL"
-                    if "_TP_" in cid:
-                        return "TP"
-                    return "TP" if oid == exit_ids[0] else "SL"
+                if st != "FILLED":
+                    continue
+                eo = self.state.get("exit_orders") or {}
+                if oid == eo.get("sl"):
+                    return "SL"
+                if oid == eo.get("tp"):
+                    return "TP"
+                # fallback if state is missing mapping
+                return "TP"
             return None
         except Exception:
             return None
@@ -670,7 +685,7 @@ async def amain() -> None:
         raise RuntimeError("Set ETHEREAL_PRIVATE_KEY (EVM private key) in env.")
 
     # Config file (auto-created if missing)
-    ticker = (os.getenv("ETHEREAL_TICKER") or "BTCUSD").strip().upper()
+    ticker = (os.getenv("ETHEREAL_TICKER") or "SOLUSD").strip().upper()
     direction = (os.getenv("ETHEREAL_DIRECTION") or "LONG").strip().upper()
     config_path = f"strategy_config_{direction}_{ticker}.json"
     cfg, created = _load_or_create_config(config_path)
@@ -706,7 +721,10 @@ async def amain() -> None:
 
 
 def main() -> None:
-    asyncio.run(amain())
+    try:
+        asyncio.run(amain())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
 
 
 if __name__ == "__main__":
