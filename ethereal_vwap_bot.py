@@ -602,6 +602,18 @@ class EtherealVWAPStrategy:
         except Exception:
             return None
 
+    @staticmethod
+    def _is_working_status(status: Optional[str]) -> bool:
+        if not status:
+            return True
+        return status.upper() in {"NEW", "PENDING", "FILLED_PARTIAL"}
+
+    @staticmethod
+    def _is_terminal_status(status: Optional[str]) -> bool:
+        if not status:
+            return False
+        return status.upper() in {"CANCELED", "EXPIRED", "REJECTED", "FILLED"}
+
     async def _adopt_existing_entry_if_any(self, side: int) -> bool:
         """If there is already a working entry LIMIT for this product+side, adopt it into state."""
         if not self.subaccount_id or not self.product_id:
@@ -925,6 +937,70 @@ class EtherealVWAPStrategy:
                 continue
         return None
 
+    async def _check_and_handle_exit_fills(
+        self,
+        vwap: Decimal,
+        entry_px: Decimal,
+        tp_px: Decimal,
+        sl_px: Decimal,
+    ) -> bool:
+        """
+        Check current OCO exit orders recorded in state and handle a fill immediately.
+
+        This is more reliable than position-based detection because a position can open+close
+        between polling intervals, while the FILLED order remains queryable.
+
+        Returns True if we handled a fill (and caller should stop further actions this step).
+        """
+        exit_ids = list(self.state.get("exit_order_ids") or [])
+        if not exit_ids:
+            return False
+
+        reason = await self._detect_close_reason(exit_ids)
+        if not reason:
+            # If both exits are no longer working (stale ids), clear them to avoid blocking entries forever.
+            try:
+                statuses = [await self._confirm_order_status(str(oid)) for oid in exit_ids]
+                if statuses and all(self._is_terminal_status(s) and (s or "").upper() != "FILLED" for s in statuses):
+                    await self._cancel_exits()
+                    self._save_state()
+            except Exception:
+                pass
+            return False
+
+        # Exit filled: cancel leftovers and record close reason.
+        await self._cancel_exits()
+        await self._cancel_entry()
+        self.state["last_close_reason"] = reason
+        self.state["last_close_at"] = _utc_now().isoformat()
+
+        if reason == "SL" and self.cfg.pause_on_sl:
+            self.state["trading_paused"] = True
+            self.state["pause_reason"] = "SL"
+            self.state["paused_at"] = _utc_now().isoformat()
+            self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
+            self._save_state()
+            logger.warning(
+                "PAUSED: stop-loss detected from exit order fill. vwap=%s entry=%s tp=%s sl=%s resume_at=%s",
+                str(vwap),
+                str(entry_px),
+                str(tp_px),
+                str(sl_px),
+                self.state.get("pause_release_price"),
+            )
+            return True
+
+        self._save_state()
+        logger.info(
+            "Position closed by %s (from exit order fill). vwap=%s entry=%s tp=%s sl=%s",
+            reason,
+            str(vwap),
+            str(entry_px),
+            str(tp_px),
+            str(sl_px),
+        )
+        return False
+
     def _pause_released(self, price: Decimal, vwap: Decimal) -> bool:
         if not self.state.get("trading_paused"):
             return True
@@ -984,6 +1060,11 @@ class EtherealVWAPStrategy:
         price = await self.get_oracle_price()
         vwap = await self._get_vwap(anchor_start_ms, now_ms)
         entry_px, tp_px, sl_px = self._levels(vwap)
+
+        # Handle SL/TP fills even if position visibility lags.
+        handled = await self._check_and_handle_exit_fills(vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px)
+        if handled:
+            return
 
         pos = await self._get_open_position()
         pos_size = _as_decimal((pos or {}).get("size") or "0").copy_abs() if pos else Decimal("0")
@@ -1049,6 +1130,10 @@ class EtherealVWAPStrategy:
                     str(sl_px),
                     self.state.get("pause_release_price"),
                 )
+                return
+
+            # If we still have active exits recorded, do not place new entries (position visibility can lag).
+            if self.state.get("exit_order_ids"):
                 return
 
             # On every new candle, re-place entry at fresh level (like original).
