@@ -72,6 +72,12 @@ class StrategyConfig:
     max_trade_pages: int = 6  # VWAP from public trades: pages*limit trades
     trades_page_limit: int = 200  # API constraint: max 200
     vwap_recalc_threshold: Decimal = Decimal("0.0005")  # 0.05% like original bot
+    # VWAP robustness under high trade throughput:
+    # - overlap_ms: re-scan a small recent window to avoid missing same-ms trades
+    # - overflow_max_trade_pages: temporary higher scan budget when backlog is too large
+    trade_overlap_ms: int = 2000
+    trade_id_cache_size: int = 5000
+    overflow_max_trade_pages: int = 50
 
 
 class EtherealVWAPStrategy:
@@ -175,6 +181,8 @@ class EtherealVWAPStrategy:
         self.state.setdefault("cum_pq", "0")
         self.state.setdefault("cum_q", "0")
         self.state.setdefault("last_trade_ts", 0)  # ms timestamp of last processed trade
+        # Rolling cache of processed trade ids (strings) to dedupe overlap rescans.
+        self.state.setdefault("recent_trade_ids", [])
 
     def _save_state(self) -> None:
         with open(self.state_file, "w", encoding="utf-8") as f:
@@ -278,57 +286,100 @@ class EtherealVWAPStrategy:
         return data, next_cursor, has_next
 
     async def _sync_vwap_from_trades(self, anchor_start_ms: int) -> Decimal:
-        """Incrementally update VWAP accumulators from public trades since last_trade_ts."""
-        last_ts = int(self.state.get("last_trade_ts") or 0)
-        if last_ts <= 0:
-            last_ts = anchor_start_ms
+        """
+        Incrementally update VWAP accumulators from public trades.
 
-        cursor: Optional[str] = None
-        pages = 0
-        batch: list[dict] = []
+        Note: On sharp moves, there can be more than max_trade_pages*limit trades between polls.
+        To reduce drift we:
+        - re-scan a small overlap window and dedupe by trade id
+        - if we detect overflow, re-run once with overflow_max_trade_pages
+        """
 
-        while pages < int(self.cfg.max_trade_pages):
-            trades, next_cursor, has_next = await self._fetch_public_trades_page(cursor)
-            if not trades:
-                break
+        async def fetch_batch(pages_limit: int) -> tuple[list[dict], bool]:
+            last_ts_local = int(self.state.get("last_trade_ts") or 0)
+            if last_ts_local <= 0:
+                last_ts_local = anchor_start_ms
+            cutoff_ts = max(anchor_start_ms, last_ts_local - int(self.cfg.trade_overlap_ms))
 
-            stop = False
-            for t in trades:
-                ts = int(t.get("createdAt") or 0)
-                if ts and ts <= last_ts:
-                    stop = True
+            cursor_local: Optional[str] = None
+            pages_local = 0
+            batch_local: list[dict] = []
+            reached_cutoff = False
+            saw_more = False
+
+            while pages_local < int(pages_limit):
+                trades, next_cursor, has_next = await self._fetch_public_trades_page(cursor_local)
+                if not trades:
                     break
-                if ts and ts < anchor_start_ms:
-                    stop = True
-                    break
-                batch.append(t)
 
-            pages += 1
-            if stop or not has_next or not next_cursor:
-                break
-            cursor = next_cursor
+                stop = False
+                for tr in trades:
+                    ts = int(tr.get("createdAt") or 0)
+                    if ts and ts < cutoff_ts:
+                        stop = True
+                        reached_cutoff = True
+                        break
+                    batch_local.append(tr)
+
+                pages_local += 1
+                if stop:
+                    break
+                if not has_next or not next_cursor:
+                    reached_cutoff = True
+                    break
+                cursor_local = next_cursor
+                saw_more = True
+
+            # Overflow = we exhausted our page budget without reaching cutoff, but API indicates more pages exist.
+            overflow = bool(saw_more and (not reached_cutoff) and pages_local >= int(pages_limit))
+            return batch_local, overflow
+
+        batch, overflow = await fetch_batch(int(self.cfg.max_trade_pages))
+        if overflow and int(self.cfg.overflow_max_trade_pages) > int(self.cfg.max_trade_pages):
+            logger.warning(
+                "VWAP trade backlog overflow (pages=%s, limit=%s). Re-scanning with overflow_max_trade_pages=%s.",
+                int(self.cfg.max_trade_pages),
+                int(self.cfg.trades_page_limit),
+                int(self.cfg.overflow_max_trade_pages),
+            )
+            batch, _ = await fetch_batch(int(self.cfg.overflow_max_trade_pages))
 
         if batch:
             # trades were fetched in desc; process in chronological order
             batch.sort(key=lambda x: int(x.get("createdAt") or 0))
+
+            recent_ids_list = list(self.state.get("recent_trade_ids") or [])
+            recent_ids = set(str(x) for x in recent_ids_list)
+
             cum_pq = _as_decimal(self.state.get("cum_pq") or "0")
             cum_q = _as_decimal(self.state.get("cum_q") or "0")
-            max_ts = last_ts
+            max_ts = int(self.state.get("last_trade_ts") or 0) or anchor_start_ms
 
-            for t in batch:
-                ts = int(t.get("createdAt") or 0)
-                price = _as_decimal(t.get("price") or "0")
-                qty = _as_decimal(t.get("filled") or "0")
-                if ts <= 0 or price <= 0 or qty <= 0:
+            for tr in batch:
+                tid = str(tr.get("id") or "")
+                if not tid or tid in recent_ids:
+                    continue
+                ts = int(tr.get("createdAt") or 0)
+                price = _as_decimal(tr.get("price") or "0")
+                qty = _as_decimal(tr.get("filled") or "0")
+                if ts <= 0 or ts < anchor_start_ms or price <= 0 or qty <= 0:
                     continue
                 cum_pq += price * qty
                 cum_q += qty
                 if ts > max_ts:
                     max_ts = ts
+                recent_ids.add(tid)
+                recent_ids_list.append(tid)
+
+            # Keep only last N ids to bound memory/state file size.
+            keep_n = max(0, int(self.cfg.trade_id_cache_size))
+            if keep_n and len(recent_ids_list) > keep_n:
+                recent_ids_list = recent_ids_list[-keep_n:]
 
             self.state["cum_pq"] = str(cum_pq)
             self.state["cum_q"] = str(cum_q)
-            self.state["last_trade_ts"] = max_ts
+            self.state["last_trade_ts"] = int(max_ts)
+            self.state["recent_trade_ids"] = recent_ids_list
             self._save_state()
 
         cum_q_now = _as_decimal(self.state.get("cum_q") or "0")
@@ -878,6 +929,9 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 max_trade_pages=int(raw.get("max_trade_pages", 6)),
                 trades_page_limit=trades_page_limit,
                 vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
+                trade_overlap_ms=int(raw.get("trade_overlap_ms", 2000)),
+                trade_id_cache_size=int(raw.get("trade_id_cache_size", 5000)),
+                overflow_max_trade_pages=int(raw.get("overflow_max_trade_pages", 50)),
             ),
             False,
         )
@@ -904,6 +958,9 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "max_trade_pages": cfg.max_trade_pages,
                 "trades_page_limit": cfg.trades_page_limit,
                 "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
+                "trade_overlap_ms": cfg.trade_overlap_ms,
+                "trade_id_cache_size": cfg.trade_id_cache_size,
+                "overflow_max_trade_pages": cfg.overflow_max_trade_pages,
             },
             f,
             indent=2,
