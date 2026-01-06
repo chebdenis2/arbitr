@@ -52,7 +52,7 @@ class StrategyConfig:
     # Candle timeframe used for "new candle" refresh logic (like original bot).
     timeframe: str = "1h"
     # VWAP anchor period (like original bot).
-    anchor_period: str = "Session"  # Session|Week|Month|Year
+    anchor_period: str = "Session"  # Session|Week|Month|Year|Hour|2 Hours|4 Hours|8 Hours|12 Hours
 
     # One entry level
     entry_distance_long_pct: Decimal = Decimal("1.0")  # % from VWAP for LONG
@@ -206,15 +206,43 @@ class EtherealVWAPStrategy:
 
     def _anchor_start(self, t: datetime) -> datetime:
         t = t.astimezone(timezone.utc)
-        p = self.cfg.anchor_period
-        if p == "Session":
+        p_raw = (self.cfg.anchor_period or "").strip()
+        p = p_raw.lower()
+
+        # TradingView-style rolling anchors (timeframe.change):
+        #   "Hour"     => timeframe.change("60")
+        #   "2 Hours"  => timeframe.change("120")
+        #   "4 Hours"  => timeframe.change("240")
+        #   "8 Hours"  => timeframe.change("480")
+        #   "12 Hours" => timeframe.change("720")
+        hour_map = {
+            "hour": 1,
+            "1 hour": 1,
+            "2 hours": 2,
+            "4 hours": 4,
+            "8 hours": 8,
+            "12 hours": 12,
+            # Common shorthand aliases
+            "1h": 1,
+            "2h": 2,
+            "4h": 4,
+            "8h": 8,
+            "12h": 12,
+        }
+        if p in hour_map:
+            interval_ms = hour_map[p] * 3_600_000
+            t_ms = _dt_to_ms(t)
+            start_ms = t_ms - (t_ms % interval_ms)
+            return _ms_to_dt(start_ms)
+
+        if p == "session":
             return t.replace(hour=0, minute=0, second=0, microsecond=0)
-        if p == "Week":
+        if p == "week":
             start = t - timedelta(days=t.weekday())
             return start.replace(hour=0, minute=0, second=0, microsecond=0)
-        if p == "Month":
+        if p == "month":
             return t.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        if p == "Year":
+        if p == "year":
             return t.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
         return t
 

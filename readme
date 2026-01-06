@@ -30,7 +30,7 @@ Edit it to change:
 - `entry_quantity`
 - `entry_expires_in_sec` / `exit_expires_in_sec`
 - `tp_pct` / `sl_pct`
-- `anchor_period` (Session/Week/Month/Year)
+- `anchor_period` (Session/Week/Month/Year/Hour/2 Hours/4 Hours/8 Hours/12 Hours)
 
 ### Optional env vars
 
