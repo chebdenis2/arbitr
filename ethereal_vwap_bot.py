@@ -193,6 +193,10 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_trade_ts", 0)  # ms timestamp of last processed trade
         # Rolling cache of processed trade ids (strings) to dedupe overlap rescans.
         self.state.setdefault("recent_trade_ids", [])
+        # For robust position transition detection.
+        self.state.setdefault("last_position_size", "0")
+        self.state.setdefault("last_close_reason", None)
+        self.state.setdefault("last_close_at", None)
 
     def _save_state(self) -> None:
         with open(self.state_file, "w", encoding="utf-8") as f:
@@ -870,6 +874,57 @@ class EtherealVWAPStrategy:
         except Exception:
             return None
 
+    async def _detect_close_reason_from_recent_orders(self) -> Optional[str]:
+        """
+        Fallback close-reason detector.
+
+        Sometimes state can lose exit ids (e.g. restart, manual cancels, etc.). To still detect SL,
+        we look at the most recent FILLED reduce-only stop orders for this product and (if present)
+        match against our last known OCO group id.
+        """
+        if not self.subaccount_id or not self.product_id:
+            return None
+        try:
+            orders = await self.client.list_orders(
+                subaccount_id=str(self.subaccount_id),
+                product_ids=[str(self.product_id)],
+                limit=100,
+                order="desc",
+                order_by="createdAt",
+            )
+        except Exception:
+            return None
+        if not orders:
+            return None
+
+        want_group = str(self.state.get("exit_group_id") or "")
+        for o in orders:
+            try:
+                status = (getattr(o, "status", "") or "").upper()
+                if status != "FILLED":
+                    continue
+                # match group if we have it (preferred)
+                og = str(getattr(o, "group_id", "") or getattr(o, "groupId", "") or "")
+                if want_group and og and og != want_group:
+                    continue
+                reduce_only = bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False))
+                if not reduce_only:
+                    continue
+                st = getattr(o, "stop_type", None)
+                stv = getattr(st, "value", st)
+                try:
+                    stv_int = int(stv)
+                except Exception:
+                    stv_int = None
+                # stop_type: 0=GAIN (TP), 1=LOSS (SL)
+                if stv_int == 1:
+                    return "SL"
+                if stv_int == 0:
+                    return "TP"
+            except Exception:
+                continue
+        return None
+
     def _pause_released(self, price: Decimal, vwap: Decimal) -> bool:
         if not self.state.get("trading_paused"):
             return True
@@ -931,7 +986,13 @@ class EtherealVWAPStrategy:
         entry_px, tp_px, sl_px = self._levels(vwap)
 
         pos = await self._get_open_position()
-        has_pos = bool(pos and _as_decimal(pos.get("size") or "0").copy_abs() > 0)
+        pos_size = _as_decimal((pos or {}).get("size") or "0").copy_abs() if pos else Decimal("0")
+        has_pos = bool(pos and pos_size > 0)
+
+        # Persist last position size to detect transitions reliably.
+        prev_size = _as_decimal(self.state.get("last_position_size") or "0").copy_abs()
+        self.state["last_position_size"] = str(pos_size)
+        # NOTE: we save state only on meaningful events to avoid excessive writes.
 
         # Handle pause-after-SL
         if self.state.get("trading_paused"):
@@ -951,28 +1012,56 @@ class EtherealVWAPStrategy:
                 return
 
         if not has_pos:
+            # Detect position close transition (prev>0 -> now==0) and decide pause reason.
+            closed_now = prev_size > 0 and pos_size <= 0
+
             # If position is closed, clean exits and possibly set pause on SL
             exit_ids = list(self.state.get("exit_order_ids") or [])
+            reason: Optional[str] = None
+            if closed_now:
+                # Prefer explicit exit ids; fallback to recent filled stop orders.
+                reason = await self._detect_close_reason(exit_ids) if exit_ids else None
+                if reason is None:
+                    reason = await self._detect_close_reason_from_recent_orders()
+
             if exit_ids:
-                reason = await self._detect_close_reason(exit_ids)
                 await self._cancel_exits()
-                if reason == "SL" and self.cfg.pause_on_sl:
-                    # Cancel any working entry too; we don't want orders while paused.
-                    await self._cancel_entry()
-                    self.state["trading_paused"] = True
-                    self.state["pause_reason"] = "SL"
-                    self.state["paused_at"] = _utc_now().isoformat()
-                    self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
-                    self._save_state()
-                    logger.warning(
-                        "PAUSED: stop-loss hit. Will resume after price touches opposite entry level (%s).",
-                        self.state.get("pause_release_price"),
-                    )
-                    return
+
+            if closed_now and reason:
+                self.state["last_close_reason"] = reason
+                self.state["last_close_at"] = _utc_now().isoformat()
+                self._save_state()
+
+            if closed_now and reason == "SL" and self.cfg.pause_on_sl:
+                # Cancel any working entry too; we don't want orders while paused.
+                await self._cancel_entry()
+                self.state["trading_paused"] = True
+                self.state["pause_reason"] = "SL"
+                self.state["paused_at"] = _utc_now().isoformat()
+                self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
+                self._save_state()
+                logger.warning(
+                    "PAUSED: stop-loss detected (reason=%s). vwap=%s entry=%s tp=%s sl=%s resume_at=%s",
+                    reason,
+                    str(vwap),
+                    str(entry_px),
+                    str(tp_px),
+                    str(sl_px),
+                    self.state.get("pause_release_price"),
+                )
+                return
 
             # On every new candle, re-place entry at fresh level (like original).
             if is_new_candle:
                 await self._cancel_entry()
+                logger.info(
+                    "NEW CANDLE refresh: vwap=%s entry=%s tp=%s sl=%s (source=%s)",
+                    str(vwap),
+                    str(entry_px),
+                    str(tp_px),
+                    str(sl_px),
+                    str(self.cfg.vwap_source),
+                )
             await self._ensure_entry_order(entry_px)
             return
 
