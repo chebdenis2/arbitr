@@ -34,11 +34,14 @@ Edit it to change:
 - `pause_on_sl` (true/false) — если true, то после SL бот ставит торговлю на паузу до касания противоположного entry-уровня
 - `max_trade_pages` / `trades_page_limit` — сколько публичных трейдов сканировать для VWAP (на сильной волатильности увеличивайте)
 - `trade_overlap_ms` / `trade_id_cache_size` / `overflow_max_trade_pages` — защита от “пропусков” трейдов при резких разлетах
+- `vwap_source` — источник данных для VWAP (`ethereal_trades` или `bybit_klines`)
+- `bybit_symbol` / `bybit_category` / `bybit_kline_interval` — настройки Bybit VWAP (если выбран `bybit_klines`)
 
 ### Почему VWAP может отличаться от TradingView
 
 В этом боте VWAP считается по **публичным трейдам Ethereal** (sum(price*qty)/sum(qty)) с ограничением на пагинацию.
 TradingView VWAP обычно считается по **барному объёму (OHLCV)**, поэтому при резких импульсах и/или если за короткое время проходит очень много трейдов значения могут немного расходиться.
+Также важно: если в TradingView выбран **Bybit SOLUSDT Perp**, а бот торгует **Ethereal SOL-USD**, то это разные рынки и расхождение может быть большим даже при идеальном VWAP.
 
 ### Optional env vars
 

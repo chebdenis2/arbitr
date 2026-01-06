@@ -10,6 +10,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from uuid import UUID
 
+import httpx
 from ethereal import AsyncRESTClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -78,6 +79,15 @@ class StrategyConfig:
     trade_overlap_ms: int = 2000
     trade_id_cache_size: int = 5000
     overflow_max_trade_pages: int = 50
+
+    # VWAP data source:
+    # - ethereal_trades: VWAP from Ethereal public trades (default)
+    # - bybit_klines: VWAP from Bybit kline bars using HLC3*volume (closer to TradingView)
+    vwap_source: str = "ethereal_trades"
+    bybit_base_url: str = "https://api.bybit.com"
+    bybit_category: str = "linear"  # linear|inverse|spot
+    bybit_symbol: str = "SOLUSDT"
+    bybit_kline_interval: str = "1"  # minutes: 1,3,5,15,30,60,120,240,360,720, D,W,M
 
 
 class EtherealVWAPStrategy:
@@ -284,6 +294,93 @@ class EtherealVWAPStrategy:
         next_cursor = res.get("nextCursor")
         has_next = bool(res.get("hasNext"))
         return data, next_cursor, has_next
+
+    async def _vwap_from_bybit_klines(self, anchor_start_ms: int, now_ms: int) -> Decimal:
+        """
+        Compute anchored VWAP using Bybit klines:
+          VWAP = sum(typical_price * volume) / sum(volume)
+        where typical_price = (high + low + close) / 3.
+
+        This tends to match TradingView's VWAP behavior more closely than trade-tape VWAP,
+        and uses the same market feed as TV when the chart is Bybit.
+        """
+        base_url = (self.cfg.bybit_base_url or "https://api.bybit.com").rstrip("/")
+        url = f"{base_url}/v5/market/kline"
+
+        start = int(anchor_start_ms)
+        end = int(now_ms)
+        if end <= start:
+            return Decimal("NaN")
+
+        sum_pv = Decimal("0")
+        sum_v = Decimal("0")
+
+        # Bybit v5 returns up to 200 klines per call, newest-first.
+        # We'll page forward by moving start time.
+        limit = 200
+        interval = str(self.cfg.bybit_kline_interval or "1")
+        category = str(self.cfg.bybit_category or "linear")
+        symbol = str(self.cfg.bybit_symbol or "SOLUSDT")
+
+        async with httpx.AsyncClient(timeout=10) as c:
+            cur = start
+            safety = 0
+            while cur < end and safety < 200:
+                params = {
+                    "category": category,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "start": cur,
+                    "end": end,
+                    "limit": limit,
+                }
+                r = await c.get(url, params=params)
+                r.raise_for_status()
+                payload = r.json()
+                if str(payload.get("retCode")) != "0":
+                    raise RuntimeError(f"Bybit error retCode={payload.get('retCode')} retMsg={payload.get('retMsg')}")
+                lst = (((payload.get("result") or {}).get("list")) or [])
+                if not lst:
+                    break
+
+                # Each item: [startTime, open, high, low, close, volume, turnover]
+                # Typically newest-first; sort by time ascending for stable pagination.
+                rows = sorted(lst, key=lambda x: int(x[0]))
+                last_t = None
+                for it in rows:
+                    try:
+                        t0 = int(it[0])
+                        h = _as_decimal(it[2])
+                        l = _as_decimal(it[3])
+                        cl = _as_decimal(it[4])
+                        v = _as_decimal(it[5])
+                    except Exception:
+                        continue
+                    if t0 < start or t0 > end:
+                        continue
+                    if v <= 0:
+                        last_t = t0
+                        continue
+                    tp = (h + l + cl) / Decimal("3")
+                    sum_pv += tp * v
+                    sum_v += v
+                    last_t = t0
+
+                if last_t is None:
+                    break
+                # Advance start; +1ms to avoid repeating the last candle.
+                cur = int(last_t) + 1
+                safety += 1
+
+        if sum_v <= 0:
+            return Decimal("NaN")
+        return sum_pv / sum_v
+
+    async def _get_vwap(self, anchor_start_ms: int, now_ms: int) -> Decimal:
+        src = (self.cfg.vwap_source or "ethereal_trades").strip().lower()
+        if src == "bybit_klines":
+            return await self._vwap_from_bybit_klines(anchor_start_ms, now_ms)
+        return await self._sync_vwap_from_trades(anchor_start_ms)
 
     async def _sync_vwap_from_trades(self, anchor_start_ms: int) -> Decimal:
         """
@@ -830,7 +927,7 @@ class EtherealVWAPStrategy:
             logger.info("NEW CANDLE %s — full refresh", _ms_to_dt(candle_start_ms).isoformat())
 
         price = await self.get_oracle_price()
-        vwap = await self._sync_vwap_from_trades(anchor_start_ms)
+        vwap = await self._get_vwap(anchor_start_ms, now_ms)
         entry_px, tp_px, sl_px = self._levels(vwap)
 
         pos = await self._get_open_position()
@@ -932,6 +1029,11 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 trade_overlap_ms=int(raw.get("trade_overlap_ms", 2000)),
                 trade_id_cache_size=int(raw.get("trade_id_cache_size", 5000)),
                 overflow_max_trade_pages=int(raw.get("overflow_max_trade_pages", 50)),
+                vwap_source=str(raw.get("vwap_source", "ethereal_trades")),
+                bybit_base_url=str(raw.get("bybit_base_url", "https://api.bybit.com")),
+                bybit_category=str(raw.get("bybit_category", "linear")),
+                bybit_symbol=str(raw.get("bybit_symbol", "SOLUSDT")),
+                bybit_kline_interval=str(raw.get("bybit_kline_interval", "1")),
             ),
             False,
         )
@@ -961,6 +1063,11 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "trade_overlap_ms": cfg.trade_overlap_ms,
                 "trade_id_cache_size": cfg.trade_id_cache_size,
                 "overflow_max_trade_pages": cfg.overflow_max_trade_pages,
+                "vwap_source": cfg.vwap_source,
+                "bybit_base_url": cfg.bybit_base_url,
+                "bybit_category": cfg.bybit_category,
+                "bybit_symbol": cfg.bybit_symbol,
+                "bybit_kline_interval": cfg.bybit_kline_interval,
             },
             f,
             indent=2,
