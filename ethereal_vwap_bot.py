@@ -166,6 +166,9 @@ class EtherealVWAPStrategy:
         self.state.setdefault("trading_paused", False)
         self.state.setdefault("pause_reason", None)
         self.state.setdefault("paused_at", None)
+        # If trading is paused, we can persist a fixed resume level to avoid "moving target"
+        # due to VWAP changing while paused.
+        self.state.setdefault("pause_release_price", None)
         self.state.setdefault("last_anchor_start_ms", 0)
         self.state.setdefault("last_candle_start_ms", 0)
         # VWAP accumulator from anchor (using trades VWAP: sum(price*qty)/sum(qty))
@@ -375,6 +378,27 @@ class EtherealVWAPStrategy:
             sl = vwap * (Decimal("1") + p_sl / Decimal("100"))
 
         return self._round_price(entry), self._round_price(tp), self._round_price(sl)
+
+    def _opposite_entry_level(self, vwap: Decimal) -> Decimal:
+        """
+        Entry level for the *opposite* direction (used as pause-release condition).
+
+        Example:
+        - Strategy SHORT: after SL, pause until price touches LONG entry level.
+        - Strategy LONG:  after SL, pause until price touches SHORT entry level.
+        """
+        if not (vwap == vwap) or vwap <= 0:
+            return Decimal("NaN")
+
+        if self.direction == "SHORT":
+            # LONG entry: below VWAP using long distance.
+            p = self.cfg.entry_distance_long_pct
+            lvl = vwap * (Decimal("1") - p / Decimal("100"))
+        else:
+            # SHORT entry: above VWAP using short distance.
+            p = self.cfg.entry_distance_short_pct
+            lvl = vwap * (Decimal("1") + p / Decimal("100"))
+        return self._round_price(lvl)
 
     # ---------------------------
     # Position + orders
@@ -703,15 +727,26 @@ class EtherealVWAPStrategy:
             return True
         if not (price == price) or price <= 0 or not (vwap == vwap) or vwap <= 0:
             return False
-        p = self.cfg.entry_distance_long_pct if self.direction == "LONG" else self.cfg.entry_distance_short_pct
-        if p <= 0:
+
+        # Prefer a fixed target saved at SL time; otherwise derive from current VWAP.
+        tgt_raw = self.state.get("pause_release_price")
+        if tgt_raw is not None:
+            try:
+                target = _as_decimal(tgt_raw)
+            except Exception:
+                target = Decimal("NaN")
+        else:
+            target = self._opposite_entry_level(vwap)
+
+        if not (target == target) or target <= 0:
             return False
-        # Same logic as your Bybit version: after SL, wait for opposite L1 touch
+
+        # After SL:
+        # - LONG strategy: wait for price to touch SHORT entry (above VWAP) => price >= target
+        # - SHORT strategy: wait for price to touch LONG entry (below VWAP) => price <= target
         if self.direction == "LONG":
-            opposite_l1 = vwap * (Decimal("1") + p / Decimal("100"))
-            return price >= opposite_l1
-        opposite_l1 = vwap * (Decimal("1") - p / Decimal("100"))
-        return price <= opposite_l1
+            return price >= target
+        return price <= target
 
     async def step(self) -> None:
         assert self.subaccount_id is not None and self.product_id is not None
@@ -756,6 +791,7 @@ class EtherealVWAPStrategy:
                 self.state["trading_paused"] = False
                 self.state["pause_reason"] = None
                 self.state["paused_at"] = None
+                self.state["pause_release_price"] = None
                 self._save_state()
                 logger.warning("PAUSE cleared: resume condition met.")
             else:
@@ -773,11 +809,17 @@ class EtherealVWAPStrategy:
                 reason = await self._detect_close_reason(exit_ids)
                 await self._cancel_exits()
                 if reason == "SL" and self.cfg.pause_on_sl:
+                    # Cancel any working entry too; we don't want orders while paused.
+                    await self._cancel_entry()
                     self.state["trading_paused"] = True
                     self.state["pause_reason"] = "SL"
                     self.state["paused_at"] = _utc_now().isoformat()
+                    self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
                     self._save_state()
-                    logger.warning("PAUSED: stop-loss hit. Will resume after opposite L1 touch.")
+                    logger.warning(
+                        "PAUSED: stop-loss hit. Will resume after price touches opposite entry level (%s).",
+                        self.state.get("pause_release_price"),
+                    )
                     return
 
             # On every new candle, re-place entry at fresh level (like original).
