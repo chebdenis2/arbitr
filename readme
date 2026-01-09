@@ -46,6 +46,38 @@ python3 ethereal_vwap_bot.py
 - Для каждого инструмента будут свои файлы состояния `strategy_state_<DIRECTION>_<TICKER>.json`
 - Все стратегии запускаются параллельно в одном процессе и используют один `AsyncRESTClient`
 
+Пример `strategy_config_multi.json`, где **для каждого инструмента свои настройки**:
+
+```json
+{
+  "subaccount_index": 0,
+  "strategies": [
+    {
+      "ticker": "SOLUSD",
+      "direction": "SHORT",
+      "timeframe": "1m",
+      "anchor_period": "hour",
+      "entry_distance_long_pct": "0.3",
+      "entry_distance_short_pct": "0.2",
+      "entry_quantity": "5",
+      "tp_pct": "0.4",
+      "sl_pct": "0.7"
+    },
+    {
+      "ticker": "ETHUSD",
+      "direction": "LONG",
+      "timeframe": "5m",
+      "anchor_period": "session",
+      "entry_distance_long_pct": "0.4",
+      "entry_distance_short_pct": "0.4",
+      "entry_quantity": "0.05",
+      "tp_pct": "0.6",
+      "sl_pct": "1.2"
+    }
+  ]
+}
+```
+
 Edit it to change:
 - `entry_distance_long_pct` / `entry_distance_short_pct`
 - `entry_quantity`
@@ -75,3 +107,4 @@ TradingView VWAP обычно считается по **барному объё�
 Multi:
 - `ETHEREAL_TICKERS` (например `SOLUSD,ETHUSD`) — включает multi-mode и создаёт `strategy_config_multi.json`, если его нет
 - `ETHEREAL_MULTI=1` — форсирует multi-mode (даже если `ETHEREAL_TICKERS` не задан)
+- `ETHEREAL_ENTRY_QTY_ALL=1` — если задан `ETHEREAL_ENTRY_QTY`, применить его ко всем инструментам (иначе в multi-mode игнорируется)

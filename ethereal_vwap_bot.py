@@ -1409,10 +1409,16 @@ async def amain() -> None:
             if not cfgs:
                 raise RuntimeError(f"{MULTI_CONFIG_FILE} has no strategies. Add at least 1 strategy and re-run.")
 
-            # allow env override (optional): apply to all strategies
-            if os.getenv("ETHEREAL_ENTRY_QTY"):
+            # Optional global override for multi-mode.
+            # We keep it explicit to avoid unintentionally overwriting per-instrument config.
+            if os.getenv("ETHEREAL_ENTRY_QTY") and _truthy_env("ETHEREAL_ENTRY_QTY_ALL"):
                 q = _as_decimal(os.getenv("ETHEREAL_ENTRY_QTY"))
                 cfgs = [StrategyConfig(**{**c.__dict__, "entry_quantity": q}) for c in cfgs]
+            elif os.getenv("ETHEREAL_ENTRY_QTY") and not _truthy_env("ETHEREAL_ENTRY_QTY_ALL"):
+                logger.warning(
+                    "ETHEREAL_ENTRY_QTY is set but ignored in multi-mode. "
+                    "Set ETHEREAL_ENTRY_QTY_ALL=1 to apply it to all instruments."
+                )
 
             sub_idx = int(os.getenv("ETHEREAL_SUBACCOUNT_INDEX", str(sub_idx_from_file)))
 
