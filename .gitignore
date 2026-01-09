@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+.venv/
+venv/
+ENV/
+.env
+.env.*
+
+# Strategy runtime state/config (auto-generated)
+strategy_state_*.json
+strategy_config_*.json
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

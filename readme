@@ -1,1 +1,77 @@
-Arbitr for TradingView
+Ethereal VWAP bot (1 entry + 1 exit bracket)
+
+This repo now contains a simplified VWAP strategy adapted for `app.ethereal.trade`:
+- **1 entry**: single LIMIT order at VWAP ± entry distance (%)
+- **1 exit**: OCO bracket (TP + SL) sized to the full position
+
+### Install
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+### Run (testnet by default)
+
+Set your private key (EVM) and run:
+
+```bash
+export ETHEREAL_PRIVATE_KEY="0x..."
+export ETHEREAL_TESTNET=1
+python3 ethereal_vwap_bot.py
+```
+
+### Configuration
+
+On first run it will create a config file like:
+`strategy_config_LONG_SOLUSD.json`
+
+### Multi-instrument mode (несколько инструментов одновременно)
+
+Есть 2 способа включить режим мульти-инструментов:
+
+1) **Через переменную окружения `ETHEREAL_TICKERS`** (шаблон конфига создастся автоматически):
+
+```bash
+export ETHEREAL_PRIVATE_KEY="0x..."
+export ETHEREAL_TESTNET=1
+export ETHEREAL_TICKERS="SOLUSD,ETHUSD,BTCUSD"
+python3 ethereal_vwap_bot.py
+```
+
+При первом запуске создастся файл `strategy_config_multi.json`. Отредактируйте его и запустите бота снова.
+
+2) **Через файл `strategy_config_multi.json`** (если он уже существует) — бот автоматически запустит все стратегии из списка `strategies`.
+
+Важно:
+- Для каждого инструмента будут свои файлы состояния `strategy_state_<DIRECTION>_<TICKER>.json`
+- Все стратегии запускаются параллельно в одном процессе и используют один `AsyncRESTClient`
+
+Edit it to change:
+- `entry_distance_long_pct` / `entry_distance_short_pct`
+- `entry_quantity`
+- `entry_expires_in_sec` / `exit_expires_in_sec`
+- `tp_pct` / `sl_pct`
+- `anchor_period` (Session/Week/Month/Year/Hour/2 Hours/4 Hours/8 Hours/12 Hours)
+- `pause_on_sl` (true/false) — если true, то после SL бот ставит торговлю на паузу до касания противоположного entry-уровня
+- `max_trade_pages` / `trades_page_limit` — сколько публичных трейдов сканировать для VWAP (на сильной волатильности увеличивайте)
+- `trade_overlap_ms` / `trade_id_cache_size` / `overflow_max_trade_pages` — защита от “пропусков” трейдов при резких разлетах
+- `vwap_source` — источник данных для VWAP (`ethereal_trades` или `bybit_klines`)
+- `bybit_symbol` / `bybit_category` / `bybit_kline_interval` — настройки Bybit VWAP (если выбран `bybit_klines`)
+
+### Почему VWAP может отличаться от TradingView
+
+В этом боте VWAP считается по **публичным трейдам Ethereal** (sum(price*qty)/sum(qty)) с ограничением на пагинацию.
+TradingView VWAP обычно считается по **барному объёму (OHLCV)**, поэтому при резких импульсах и/или если за короткое время проходит очень много трейдов значения могут немного расходиться.
+Также важно: если в TradingView выбран **Bybit SOLUSDT Perp**, а бот торгует **Ethereal SOL-USD**, то это разные рынки и расхождение может быть большим даже при идеальном VWAP.
+
+### Optional env vars
+
+- `ETHEREAL_TICKER` (default `SOLUSD`)
+- `ETHEREAL_DIRECTION` (default `LONG`)
+- `ETHEREAL_SUBACCOUNT_INDEX` (default `0`)
+- `ETHEREAL_BASE_URL` (override API host)
+- `ETHEREAL_RPC_URL` (override chain RPC)
+
+Multi:
+- `ETHEREAL_TICKERS` (например `SOLUSD,ETHUSD`) — включает multi-mode и создаёт `strategy_config_multi.json`, если его нет
+- `ETHEREAL_MULTI=1` — форсирует multi-mode (даже если `ETHEREAL_TICKERS` не задан)

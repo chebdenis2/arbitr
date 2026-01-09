@@ -1,0 +1,1486 @@
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
+from typing import Any, Dict, Optional, Tuple
+from uuid import UUID
+
+import httpx
+from ethereal import AsyncRESTClient
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("ethereal_vwap_bot")
+
+__version__ = "0.2.0"
+
+MULTI_CONFIG_FILE = "strategy_config_multi.json"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dt_to_ms(t: datetime) -> int:
+    return int(t.timestamp() * 1000)
+
+
+def _ms_to_dt(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
+def _as_decimal(x: Any) -> Decimal:
+    if isinstance(x, Decimal):
+        return x
+    return Decimal(str(x))
+
+
+def _quantize_down(x: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return x
+    # quantize to step size, rounding down
+    q = (x / step).to_integral_value(rounding=ROUND_DOWN) * step
+    return q
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    ticker: str = "SOLUSD"
+    direction: str = "LONG"  # LONG|SHORT
+    poll_interval_sec: int = 3
+    # Candle timeframe used for "new candle" refresh logic (like original bot).
+    timeframe: str = "1h"
+    # VWAP anchor period (like original bot).
+    anchor_period: str = "Session"  # Session|Week|Month|Year|Hour|2 Hours|4 Hours|8 Hours|12 Hours
+
+    # One entry level
+    entry_distance_long_pct: Decimal = Decimal("1.0")  # % from VWAP for LONG
+    entry_distance_short_pct: Decimal = Decimal("1.5")  # % from VWAP for SHORT
+    entry_quantity: Decimal = Decimal("0.001")  # base asset qty
+    post_only: bool = True
+    entry_expires_in_sec: int = 7 * 24 * 3600  # GTD expiry (seconds)
+
+    # One exit "bracket" (OCO TP+SL)
+    tp_pct: Decimal = Decimal("1.5")  # % from VWAP
+    sl_pct: Decimal = Decimal("4.0")  # % from VWAP
+    exits_as_stop_market: bool = True
+    exit_expires_in_sec: int = 7 * 24 * 3600  # GTD expiry (seconds)
+
+    # Safety
+    pause_on_sl: bool = False
+    max_trade_pages: int = 6  # VWAP from public trades: pages*limit trades
+    trades_page_limit: int = 200  # API constraint: max 200
+    vwap_recalc_threshold: Decimal = Decimal("0.0005")  # 0.05% like original bot
+    # VWAP robustness under high trade throughput:
+    # - overlap_ms: re-scan a small recent window to avoid missing same-ms trades
+    # - overflow_max_trade_pages: temporary higher scan budget when backlog is too large
+    trade_overlap_ms: int = 2000
+    trade_id_cache_size: int = 5000
+    overflow_max_trade_pages: int = 50
+
+    # VWAP data source:
+    # - ethereal_trades: VWAP from Ethereal public trades (default)
+    # - bybit_klines: VWAP from Bybit kline bars using HLC3*volume (closer to TradingView)
+    vwap_source: str = "ethereal_trades"
+    bybit_base_url: str = "https://api.bybit.com"
+    bybit_category: str = "linear"  # linear|inverse|spot
+    bybit_symbol: str = "SOLUSDT"
+    bybit_kline_interval: str = "1"  # minutes: 1,3,5,15,30,60,120,240,360,720, D,W,M
+
+
+class EtherealVWAPStrategy:
+    def __init__(self, client: AsyncRESTClient, cfg: StrategyConfig, subaccount_index: int = 0):
+        self.client = client
+        self.cfg = cfg
+
+        d = (cfg.direction or "LONG").strip().upper()
+        if d in {"L", "LONG"}:
+            d = "LONG"
+        elif d in {"S", "SHORT"}:
+            d = "SHORT"
+        if d not in {"LONG", "SHORT"}:
+            raise ValueError("direction must be LONG or SHORT")
+        self.direction = d
+
+        # Ethereal constraint: clientOrderId max length is 32 chars.
+        # Keep a short unique prefix and generate compact IDs per order.
+        self.client_prefix = f"V1{self.direction[0]}{uuid.uuid4().hex[:6].upper()}"  # e.g. V1L12ABCD
+        self.state_file = f"strategy_state_{self.direction}_{cfg.ticker}.json"
+        self.config_file = f"strategy_config_{self.direction}_{cfg.ticker}.json"
+
+        self.subaccount_index = subaccount_index
+        self.subaccount_id: Optional[UUID] = None
+        self.subaccount_name: Optional[str] = None
+        self.product_id: Optional[UUID] = None
+
+        self.product_tick_size: Decimal = Decimal("0")
+        self.product_lot_size: Decimal = Decimal("0")
+        self.product_min_qty: Decimal = Decimal("0")
+        self.product_max_qty: Decimal = Decimal("0")
+
+        self.state: Dict[str, Any] = {}
+        self._load_state()
+
+    async def initialize(
+        self,
+        *,
+        subaccount_id: Optional[UUID] = None,
+        subaccount_name: Optional[str] = None,
+        products_by_ticker: Optional[dict] = None,
+    ) -> None:
+        # If the user already provided both identifiers, we can skip discovery.
+        # Note: Ethereal uses the subaccount *name* (bytes/hex string) for signing.
+        if subaccount_id and subaccount_name:
+            self.subaccount_id = subaccount_id
+            self.subaccount_name = subaccount_name
+
+        if not (self.subaccount_id and self.subaccount_name):
+            subs = await self.client.subaccounts()
+            if not subs:
+                raise RuntimeError(
+                    "No subaccounts found for this key. On Ethereal, a subaccount is created only after you "
+                    "deposit USDe. Deposit (testnet: https://deposit.etherealtest.net, mainnet: https://deposit.ethereal.trade) "
+                    "then re-run the bot."
+                )
+            idx = int(self.subaccount_index)
+            if idx < 0 or idx >= len(subs):
+                raise RuntimeError(f"subaccount_index={idx} is out of range. Found {len(subs)} subaccounts.")
+
+            self.subaccount_id = subs[idx].id
+            self.subaccount_name = subs[idx].name
+
+        products = products_by_ticker or (await self.client.products_by_ticker())
+        if self.cfg.ticker not in products:
+            raise RuntimeError(f"Unknown ticker {self.cfg.ticker}. Available: {', '.join(sorted(products.keys()))}")
+        p = products[self.cfg.ticker]
+        self.product_id = p.id
+        # SDK models expose snake_case attributes (tick_size/lot_size); aliases are tickSize/lotSize.
+        self.product_tick_size = _as_decimal(getattr(p, "tick_size", None) or getattr(p, "tickSize", "0") or "0")
+        self.product_lot_size = _as_decimal(getattr(p, "lot_size", None) or getattr(p, "lotSize", "0") or "0")
+        self.product_min_qty = _as_decimal(getattr(p, "min_quantity", None) or getattr(p, "minQuantity", "0") or "0")
+        self.product_max_qty = _as_decimal(getattr(p, "max_quantity", None) or getattr(p, "maxQuantity", "0") or "0")
+
+        logger.info(
+            "Initialized: ticker=%s product_id=%s subaccount=%s (%s)",
+            self.cfg.ticker,
+            str(self.product_id),
+            self.subaccount_name,
+            str(self.subaccount_id),
+        )
+        # Note: linked signers are optional. The subaccount owner can trade without linking a separate signer.
+
+    # ---------------------------
+    # Persistence
+    # ---------------------------
+    def _load_state(self) -> None:
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    self.state = json.load(f)
+            except Exception:
+                self.state = {}
+        else:
+            self.state = {}
+
+        self.state.setdefault("entry_order_id", None)
+        self.state.setdefault("entry_client_order_id", None)
+        self.state.setdefault("exit_order_ids", [])
+        self.state.setdefault("exit_orders", {"tp": None, "sl": None})
+        self.state.setdefault("exit_group_id", None)
+        self.state.setdefault("trading_paused", False)
+        self.state.setdefault("pause_reason", None)
+        self.state.setdefault("paused_at", None)
+        # If trading is paused, we can persist a fixed resume level to avoid "moving target"
+        # due to VWAP changing while paused.
+        self.state.setdefault("pause_release_price", None)
+        self.state.setdefault("last_anchor_start_ms", 0)
+        self.state.setdefault("last_candle_start_ms", 0)
+        # VWAP accumulator from anchor (using trades VWAP: sum(price*qty)/sum(qty))
+        self.state.setdefault("cum_pq", "0")
+        self.state.setdefault("cum_q", "0")
+        self.state.setdefault("last_trade_ts", 0)  # ms timestamp of last processed trade
+        # Rolling cache of processed trade ids (strings) to dedupe overlap rescans.
+        self.state.setdefault("recent_trade_ids", [])
+        # For robust position transition detection.
+        self.state.setdefault("last_position_size", "0")
+        self.state.setdefault("last_close_reason", None)
+        self.state.setdefault("last_close_at", None)
+
+    def _save_state(self) -> None:
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, indent=2, default=str)
+
+    # ---------------------------
+    # Anchor + VWAP
+    # ---------------------------
+    @staticmethod
+    def _timeframe_ms(tf: str) -> int:
+        s = (tf or "").strip().lower()
+        if not s:
+            raise ValueError("timeframe is empty")
+        # formats like 1m, 3m, 1h, 4h, 1d
+        num = ""
+        unit = ""
+        for ch in s:
+            if ch.isdigit():
+                num += ch
+            else:
+                unit += ch
+        if not num or not unit:
+            raise ValueError(f"Unsupported timeframe '{tf}' (expected like 1h, 3m)")
+        n = int(num)
+        if unit == "m":
+            return n * 60_000
+        if unit == "h":
+            return n * 3_600_000
+        if unit == "d":
+            return n * 86_400_000
+        raise ValueError(f"Unsupported timeframe unit '{unit}' in '{tf}'")
+
+    def _anchor_start(self, t: datetime) -> datetime:
+        t = t.astimezone(timezone.utc)
+        p_raw = (self.cfg.anchor_period or "").strip()
+        p = p_raw.lower()
+
+        # TradingView-style rolling anchors (timeframe.change):
+        #   "Hour"     => timeframe.change("60")
+        #   "2 Hours"  => timeframe.change("120")
+        #   "4 Hours"  => timeframe.change("240")
+        #   "8 Hours"  => timeframe.change("480")
+        #   "12 Hours" => timeframe.change("720")
+        hour_map = {
+            "hour": 1,
+            "1 hour": 1,
+            "2 hours": 2,
+            "4 hours": 4,
+            "8 hours": 8,
+            "12 hours": 12,
+            # Common shorthand aliases
+            "1h": 1,
+            "2h": 2,
+            "4h": 4,
+            "8h": 8,
+            "12h": 12,
+        }
+        if p in hour_map:
+            interval_ms = hour_map[p] * 3_600_000
+            t_ms = _dt_to_ms(t)
+            start_ms = t_ms - (t_ms % interval_ms)
+            return _ms_to_dt(start_ms)
+
+        if p == "session":
+            return t.replace(hour=0, minute=0, second=0, microsecond=0)
+        if p == "week":
+            start = t - timedelta(days=t.weekday())
+            return start.replace(hour=0, minute=0, second=0, microsecond=0)
+        if p == "month":
+            return t.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if p == "year":
+            return t.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return t
+
+    async def _fetch_public_trades_page(
+        self, cursor: Optional[str]
+    ) -> Tuple[list[dict], Optional[str], bool]:
+        assert self.product_id is not None
+        limit = int(self.cfg.trades_page_limit)
+        # Ethereal API constraint (observed): limit must be <= 200
+        if limit <= 0:
+            limit = 200
+        limit = min(limit, 200)
+        params: Dict[str, Any] = {
+            "productId": str(self.product_id),
+            "order": "desc",
+            "orderBy": "createdAt",
+            "limit": limit,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        res = await self.client.prepare_and_send_request(
+            "GET",
+            "/v1/order/trade",
+            params=params,
+        )
+        # res: {data: [...], hasNext: bool, nextCursor?: str}
+        data = res.get("data") or []
+        next_cursor = res.get("nextCursor")
+        has_next = bool(res.get("hasNext"))
+        return data, next_cursor, has_next
+
+    async def _vwap_from_bybit_klines(self, anchor_start_ms: int, now_ms: int) -> Decimal:
+        """
+        Compute anchored VWAP using Bybit klines:
+          VWAP = sum(typical_price * volume) / sum(volume)
+        where typical_price = (high + low + close) / 3.
+
+        This tends to match TradingView's VWAP behavior more closely than trade-tape VWAP,
+        and uses the same market feed as TV when the chart is Bybit.
+        """
+        base_url = (self.cfg.bybit_base_url or "https://api.bybit.com").rstrip("/")
+        url = f"{base_url}/v5/market/kline"
+
+        start = int(anchor_start_ms)
+        end = int(now_ms)
+        if end <= start:
+            return Decimal("NaN")
+
+        sum_pv = Decimal("0")
+        sum_v = Decimal("0")
+
+        # Bybit v5 returns up to 200 klines per call, newest-first.
+        # We'll page forward by moving start time.
+        limit = 200
+        interval = str(self.cfg.bybit_kline_interval or "1")
+        category = str(self.cfg.bybit_category or "linear")
+        symbol = str(self.cfg.bybit_symbol or "SOLUSDT")
+
+        async with httpx.AsyncClient(timeout=10) as c:
+            cur = start
+            safety = 0
+            while cur < end and safety < 200:
+                params = {
+                    "category": category,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "start": cur,
+                    "end": end,
+                    "limit": limit,
+                }
+                r = await c.get(url, params=params)
+                r.raise_for_status()
+                payload = r.json()
+                if str(payload.get("retCode")) != "0":
+                    raise RuntimeError(f"Bybit error retCode={payload.get('retCode')} retMsg={payload.get('retMsg')}")
+                lst = (((payload.get("result") or {}).get("list")) or [])
+                if not lst:
+                    break
+
+                # Each item: [startTime, open, high, low, close, volume, turnover]
+                # Typically newest-first; sort by time ascending for stable pagination.
+                rows = sorted(lst, key=lambda x: int(x[0]))
+                last_t = None
+                for it in rows:
+                    try:
+                        t0 = int(it[0])
+                        h = _as_decimal(it[2])
+                        l = _as_decimal(it[3])
+                        cl = _as_decimal(it[4])
+                        v = _as_decimal(it[5])
+                    except Exception:
+                        continue
+                    if t0 < start or t0 > end:
+                        continue
+                    if v <= 0:
+                        last_t = t0
+                        continue
+                    tp = (h + l + cl) / Decimal("3")
+                    sum_pv += tp * v
+                    sum_v += v
+                    last_t = t0
+
+                if last_t is None:
+                    break
+                # Advance start; +1ms to avoid repeating the last candle.
+                cur = int(last_t) + 1
+                safety += 1
+
+        if sum_v <= 0:
+            return Decimal("NaN")
+        return sum_pv / sum_v
+
+    async def _get_vwap(self, anchor_start_ms: int, now_ms: int) -> Decimal:
+        src = (self.cfg.vwap_source or "ethereal_trades").strip().lower()
+        if src == "bybit_klines":
+            return await self._vwap_from_bybit_klines(anchor_start_ms, now_ms)
+        return await self._sync_vwap_from_trades(anchor_start_ms)
+
+    async def _sync_vwap_from_trades(self, anchor_start_ms: int) -> Decimal:
+        """
+        Incrementally update VWAP accumulators from public trades.
+
+        Note: On sharp moves, there can be more than max_trade_pages*limit trades between polls.
+        To reduce drift we:
+        - re-scan a small overlap window and dedupe by trade id
+        - if we detect overflow, re-run once with overflow_max_trade_pages
+        """
+
+        async def fetch_batch(pages_limit: int) -> tuple[list[dict], bool]:
+            last_ts_local = int(self.state.get("last_trade_ts") or 0)
+            if last_ts_local <= 0:
+                last_ts_local = anchor_start_ms
+            cutoff_ts = max(anchor_start_ms, last_ts_local - int(self.cfg.trade_overlap_ms))
+
+            cursor_local: Optional[str] = None
+            pages_local = 0
+            batch_local: list[dict] = []
+            reached_cutoff = False
+            saw_more = False
+
+            while pages_local < int(pages_limit):
+                trades, next_cursor, has_next = await self._fetch_public_trades_page(cursor_local)
+                if not trades:
+                    break
+
+                stop = False
+                for tr in trades:
+                    ts = int(tr.get("createdAt") or 0)
+                    if ts and ts < cutoff_ts:
+                        stop = True
+                        reached_cutoff = True
+                        break
+                    batch_local.append(tr)
+
+                pages_local += 1
+                if stop:
+                    break
+                if not has_next or not next_cursor:
+                    reached_cutoff = True
+                    break
+                cursor_local = next_cursor
+                saw_more = True
+
+            # Overflow = we exhausted our page budget without reaching cutoff, but API indicates more pages exist.
+            overflow = bool(saw_more and (not reached_cutoff) and pages_local >= int(pages_limit))
+            return batch_local, overflow
+
+        batch, overflow = await fetch_batch(int(self.cfg.max_trade_pages))
+        if overflow and int(self.cfg.overflow_max_trade_pages) > int(self.cfg.max_trade_pages):
+            logger.warning(
+                "VWAP trade backlog overflow (pages=%s, limit=%s). Re-scanning with overflow_max_trade_pages=%s.",
+                int(self.cfg.max_trade_pages),
+                int(self.cfg.trades_page_limit),
+                int(self.cfg.overflow_max_trade_pages),
+            )
+            batch, _ = await fetch_batch(int(self.cfg.overflow_max_trade_pages))
+
+        if batch:
+            # trades were fetched in desc; process in chronological order
+            batch.sort(key=lambda x: int(x.get("createdAt") or 0))
+
+            recent_ids_list = list(self.state.get("recent_trade_ids") or [])
+            recent_ids = set(str(x) for x in recent_ids_list)
+
+            cum_pq = _as_decimal(self.state.get("cum_pq") or "0")
+            cum_q = _as_decimal(self.state.get("cum_q") or "0")
+            max_ts = int(self.state.get("last_trade_ts") or 0) or anchor_start_ms
+
+            for tr in batch:
+                tid = str(tr.get("id") or "")
+                if not tid or tid in recent_ids:
+                    continue
+                ts = int(tr.get("createdAt") or 0)
+                price = _as_decimal(tr.get("price") or "0")
+                qty = _as_decimal(tr.get("filled") or "0")
+                if ts <= 0 or ts < anchor_start_ms or price <= 0 or qty <= 0:
+                    continue
+                cum_pq += price * qty
+                cum_q += qty
+                if ts > max_ts:
+                    max_ts = ts
+                recent_ids.add(tid)
+                recent_ids_list.append(tid)
+
+            # Keep only last N ids to bound memory/state file size.
+            keep_n = max(0, int(self.cfg.trade_id_cache_size))
+            if keep_n and len(recent_ids_list) > keep_n:
+                recent_ids_list = recent_ids_list[-keep_n:]
+
+            self.state["cum_pq"] = str(cum_pq)
+            self.state["cum_q"] = str(cum_q)
+            self.state["last_trade_ts"] = int(max_ts)
+            self.state["recent_trade_ids"] = recent_ids_list
+            self._save_state()
+
+        cum_q_now = _as_decimal(self.state.get("cum_q") or "0")
+        if cum_q_now <= 0:
+            return Decimal("NaN")
+        return _as_decimal(self.state.get("cum_pq") or "0") / cum_q_now
+
+    # ---------------------------
+    # Market + rounding helpers
+    # ---------------------------
+    async def get_oracle_price(self) -> Decimal:
+        assert self.product_id is not None
+        prices = await self.client.list_market_prices(product_ids=[str(self.product_id)])
+        if not prices:
+            return Decimal("NaN")
+        p = prices[0]
+        return _as_decimal(getattr(p, "oraclePrice", "0") or "0")
+
+    def _round_price(self, px: Decimal) -> Decimal:
+        return _quantize_down(px, self.product_tick_size)
+
+    def _round_qty(self, qty: Decimal) -> Decimal:
+        q = _quantize_down(qty, self.product_lot_size)
+        # Enforce product min/max constraints.
+        if self.product_min_qty and q < self.product_min_qty:
+            q = _quantize_down(self.product_min_qty, self.product_lot_size)
+        if self.product_max_qty and q > self.product_max_qty:
+            q = _quantize_down(self.product_max_qty, self.product_lot_size)
+        return q
+
+    def _levels(self, vwap: Decimal) -> Tuple[Decimal, Decimal, Decimal]:
+        """(entry, tp, sl) based on VWAP and config."""
+        if not (vwap == vwap) or vwap <= 0:
+            return Decimal("NaN"), Decimal("NaN"), Decimal("NaN")
+
+        p_entry = self.cfg.entry_distance_long_pct if self.direction == "LONG" else self.cfg.entry_distance_short_pct
+        p_tp = self.cfg.tp_pct
+        p_sl = self.cfg.sl_pct
+
+        if self.direction == "LONG":
+            entry = vwap * (Decimal("1") - p_entry / Decimal("100"))
+            tp = vwap * (Decimal("1") + p_tp / Decimal("100"))
+            sl = vwap * (Decimal("1") - p_sl / Decimal("100"))
+        else:
+            entry = vwap * (Decimal("1") + p_entry / Decimal("100"))
+            tp = vwap * (Decimal("1") - p_tp / Decimal("100"))
+            sl = vwap * (Decimal("1") + p_sl / Decimal("100"))
+
+        return self._round_price(entry), self._round_price(tp), self._round_price(sl)
+
+    def _opposite_entry_level(self, vwap: Decimal) -> Decimal:
+        """
+        Entry level for the *opposite* direction (used as pause-release condition).
+
+        Example:
+        - Strategy SHORT: after SL, pause until price touches LONG entry level.
+        - Strategy LONG:  after SL, pause until price touches SHORT entry level.
+        """
+        if not (vwap == vwap) or vwap <= 0:
+            return Decimal("NaN")
+
+        if self.direction == "SHORT":
+            # LONG entry: below VWAP using long distance.
+            p = self.cfg.entry_distance_long_pct
+            lvl = vwap * (Decimal("1") - p / Decimal("100"))
+        else:
+            # SHORT entry: above VWAP using short distance.
+            p = self.cfg.entry_distance_short_pct
+            lvl = vwap * (Decimal("1") + p / Decimal("100"))
+        return self._round_price(lvl)
+
+    # ---------------------------
+    # Position + orders
+    # ---------------------------
+    async def _get_open_position(self) -> Optional[dict]:
+        assert self.subaccount_id is not None and self.product_id is not None
+        positions = await self.client.list_positions(
+            subaccount_id=str(self.subaccount_id),
+            product_ids=[str(self.product_id)],
+            open=True,
+        )
+        if not positions:
+            return None
+        # pick the latest updated one
+        p = sorted(positions, key=lambda x: getattr(x, "updatedAt", 0) or 0)[-1]
+        return p.model_dump()
+
+    async def _cancel_order_ids(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        try:
+            await self.client.cancel_orders(
+                order_ids=ids,
+                subaccount=self.subaccount_name,
+            )
+        except Exception as e:
+            logger.warning("Cancel orders failed (%s): %s", ids, e)
+
+    async def _cancel_entry(self) -> None:
+        oid = self.state.get("entry_order_id")
+        if oid:
+            await self._cancel_order_ids([oid])
+        self.state["entry_order_id"] = None
+        self.state["entry_client_order_id"] = None
+
+    async def _cancel_exits(self) -> None:
+        ids = list(self.state.get("exit_order_ids") or [])
+        if ids:
+            await self._cancel_order_ids(ids)
+        self.state["exit_order_ids"] = []
+        self.state["exit_orders"] = {"tp": None, "sl": None}
+        self.state["exit_group_id"] = None
+
+    async def _confirm_order_status(self, order_id: str) -> Optional[str]:
+        """Fetch order by id and return status (upper)."""
+        try:
+            o = await self.client.get_order(id=UUID(order_id))
+            return (getattr(o, "status", "") or "").upper()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_working_status(status: Optional[str]) -> bool:
+        if not status:
+            return True
+        return status.upper() in {"NEW", "PENDING", "FILLED_PARTIAL"}
+
+    @staticmethod
+    def _is_terminal_status(status: Optional[str]) -> bool:
+        if not status:
+            return False
+        return status.upper() in {"CANCELED", "EXPIRED", "REJECTED", "FILLED"}
+
+    async def _adopt_existing_entry_if_any(self, side: int) -> bool:
+        """If there is already a working entry LIMIT for this product+side, adopt it into state."""
+        if not self.subaccount_id or not self.product_id:
+            return False
+        try:
+            orders = await self.client.list_orders(
+                subaccount_id=str(self.subaccount_id),
+                product_ids=[str(self.product_id)],
+                is_working=True,
+                side=side,
+                limit=200,
+                order="desc",
+                order_by="createdAt",
+            )
+        except Exception:
+            return False
+
+        candidates = []
+        for o in orders or []:
+            try:
+                otype = getattr(o, "type", None)
+                otype_val = str(getattr(otype, "value", otype) or "").upper()
+                if otype_val != "LIMIT":
+                    continue
+                if bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False)):
+                    continue
+                if bool(getattr(o, "close", False)):
+                    continue
+                stop_price = str(getattr(o, "stop_price", "") or getattr(o, "stopPrice", "") or "")
+                if stop_price and stop_price not in {"0", "0.0", "0.00", "0.000", "0.0000", "0.000000000"}:
+                    continue
+                candidates.append(o)
+            except Exception:
+                continue
+
+        if not candidates:
+            return False
+
+        # Adopt the newest
+        newest = sorted(candidates, key=lambda x: getattr(x, "created_at", 0) or getattr(x, "createdAt", 0) or 0)[-1]
+        oid = str(getattr(newest, "id", "") or "")
+        cid = str(getattr(newest, "client_order_id", "") or getattr(newest, "clientOrderId", "") or "")
+        if oid:
+            self.state["entry_order_id"] = oid
+            self.state["entry_client_order_id"] = cid or None
+            self._save_state()
+            if len(candidates) > 1:
+                logger.warning("Found %d existing entry orders; adopting latest id=%s (no new orders will be placed).", len(candidates), oid)
+            else:
+                logger.info("Adopted existing entry order id=%s (no new order placed).", oid)
+            return True
+        return False
+
+    @staticmethod
+    def _result_value(x: Any) -> str:
+        """Normalize SDK enum/string results (e.g. Result.ok -> 'Ok')."""
+        try:
+            v = getattr(x, "value", None)
+            if v is not None:
+                return str(v)
+        except Exception:
+            pass
+        return str(x or "")
+
+    async def _debug_linked_signers(self) -> None:
+        """Optional helper: prints linked signers (does not affect trading)."""
+        if not self.subaccount_id:
+            return
+        try:
+            signers = await self.client.list_signers(subaccount_id=str(self.subaccount_id), limit=50)
+        except Exception:
+            return
+        if not signers:
+            return
+        logger.info("Linked signers for subaccount %s:", str(self.subaccount_id))
+        for s in signers:
+            logger.info("  signer=%s status=%s expiresAt=%s", getattr(s, "signer", None), getattr(s, "status", None), getattr(s, "expires_at", None))
+
+    def _mk_client_order_id(self, kind: str) -> str:
+        """
+        Generate a <=32 char client order id.
+        kind: 'E' | 'TP' | 'SL'
+        """
+        kind = (kind or "").upper()
+        if kind not in {"E", "TP", "SL"}:
+            kind = "X"
+        # Use last 9 digits of ms timestamp + 3 random hex chars.
+        ts = int(time.time() * 1000) % 1_000_000_000
+        rnd = uuid.uuid4().hex[:3].upper()
+        cid = f"{self.client_prefix}{kind}{ts:09d}{rnd}"
+        return cid[:32]
+
+    async def _ensure_entry_order(self, entry_px: Decimal) -> None:
+        existing_oid = self.state.get("entry_order_id")
+        if existing_oid:
+            st = await self._confirm_order_status(str(existing_oid))
+            # If we can't confirm yet, assume it's still propagating.
+            if st in {None, "", "NEW", "PENDING", "FILLED_PARTIAL"}:
+                return
+            # If order is no longer working, clear and allow re-placement.
+            if st in {"CANCELED", "EXPIRED", "REJECTED", "FILLED"}:
+                self.state["entry_order_id"] = None
+                self.state["entry_client_order_id"] = None
+                self._save_state()
+        qty = self._round_qty(self.cfg.entry_quantity)
+        if qty <= 0 or entry_px <= 0:
+            return
+
+        side = 0 if self.direction == "LONG" else 1
+
+        # If state lost the order id, but UI/API still has a working entry order, adopt it to avoid duplicating.
+        if not self.state.get("entry_order_id"):
+            adopted = await self._adopt_existing_entry_if_any(side)
+            if adopted:
+                return
+        cid = self._mk_client_order_id("E")
+
+        try:
+            sender = getattr(getattr(self.client, "chain", None), "address", None)
+            expires_at = int(time.time()) + int(self.cfg.entry_expires_in_sec)
+            o = await self.client.create_order(
+                order_type="LIMIT",
+                product_id=self.product_id,
+                ticker=self.cfg.ticker,
+                side=side,
+                quantity=float(qty),
+                price=float(entry_px),
+                post_only=bool(self.cfg.post_only),
+                time_in_force="GTD",
+                expires_at=expires_at,
+                client_order_id=cid,
+                sender=sender,
+                subaccount=self.subaccount_name,
+            )
+            oid = str(getattr(o, "id", "") or "")
+            result = self._result_value(getattr(o, "result", "") or "")
+            filled = str(getattr(o, "filled", "") or "")
+
+            # Important: API can return an id even when result != Ok (e.g. InsufficientBalance, PostOnly reject, etc.)
+            if result and result.strip().lower() != "ok":
+                logger.error(
+                    "ENTRY rejected by API: result=%s filled=%s (qty=%s px=%s)",
+                    result,
+                    filled,
+                    qty,
+                    entry_px,
+                )
+                return
+            if not oid:
+                logger.error("ENTRY submit returned empty order id (result=%s)", result or "UNKNOWN")
+                return
+
+            status = await self._confirm_order_status(oid)
+            if status in {"REJECTED", "CANCELED", "EXPIRED"}:
+                logger.error(
+                    "ENTRY not working after submit: status=%s (order_id=%s result=%s filled=%s)",
+                    status,
+                    oid,
+                    result or "UNKNOWN",
+                    filled or "0",
+                )
+                return
+
+            self.state["entry_order_id"] = oid
+            self.state["entry_client_order_id"] = cid
+            self._save_state()
+            logger.info(
+                "ENTRY placed: %s qty=%s px=%s (order_id=%s status=%s result=%s filled=%s)",
+                self.direction,
+                qty,
+                entry_px,
+                oid,
+                status or "UNKNOWN",
+                result or "UNKNOWN",
+                filled or "0",
+            )
+        except Exception as e:
+            logger.error("Failed to place ENTRY: %r", e)
+            if "401" in str(e) or "Unauthorized" in str(e):
+                logger.error(
+                    "Got 401 Unauthorized. Check ETHEREAL_TESTNET/ETHEREAL_BASE_URL match, and that this key "
+                    "is allowed to trade on this subaccount. Linked signers are only needed if trading via a separate signer."
+                )
+
+    async def _ensure_oco_exits(self, pos: dict, tp_px: Decimal, sl_px: Decimal) -> None:
+        if self.state.get("exit_order_ids"):
+            return
+
+        size = _as_decimal(pos.get("size") or "0").copy_abs()
+        qty = self._round_qty(size)
+        if qty <= 0:
+            return
+
+        # Close direction
+        exit_side = 1 if self.direction == "LONG" else 0
+        group_id = str(uuid.uuid4())
+
+        # stop_type: 0=GAIN (TP), 1=LOSS (SL)
+        try:
+            sender = getattr(getattr(self.client, "chain", None), "address", None)
+            order_type = "MARKET" if self.cfg.exits_as_stop_market else "LIMIT"
+            expires_at = int(time.time()) + int(self.cfg.exit_expires_in_sec)
+            tp = await self.client.create_order(
+                order_type=order_type,
+                product_id=self.product_id,
+                ticker=self.cfg.ticker,
+                side=exit_side,
+                quantity=float(qty),
+                reduce_only=True,
+                stop_type=0,
+                stop_price=float(tp_px),
+                price=(float(tp_px) if order_type == "LIMIT" else None),
+                time_in_force="GTD",
+                expires_at=expires_at,
+                client_order_id=self._mk_client_order_id("TP"),
+                group_id=group_id,
+                group_contingency_type=1,  # OCO
+                sender=sender,
+                subaccount=self.subaccount_name,
+            )
+            sl = await self.client.create_order(
+                order_type=order_type,
+                product_id=self.product_id,
+                ticker=self.cfg.ticker,
+                side=exit_side,
+                quantity=float(qty),
+                reduce_only=True,
+                stop_type=1,
+                stop_price=float(sl_px),
+                price=(float(sl_px) if order_type == "LIMIT" else None),
+                time_in_force="GTD",
+                expires_at=expires_at,
+                client_order_id=self._mk_client_order_id("SL"),
+                group_id=group_id,
+                group_contingency_type=1,  # OCO
+                sender=sender,
+                subaccount=self.subaccount_name,
+            )
+            tp_id = str(getattr(tp, "id"))
+            sl_id = str(getattr(sl, "id"))
+            self.state["exit_order_ids"] = [tp_id, sl_id]
+            self.state["exit_orders"] = {"tp": tp_id, "sl": sl_id}
+            self.state["exit_group_id"] = group_id
+            self._save_state()
+            logger.info("EXITS placed (OCO): TP=%s SL=%s qty=%s group=%s", tp_px, sl_px, qty, group_id)
+        except Exception as e:
+            logger.error("Failed to place exits: %s", e)
+
+    async def _detect_close_reason(self, exit_ids: list[str]) -> Optional[str]:
+        """Return 'TP'|'SL'|None based on which exit filled."""
+        if not exit_ids:
+            return None
+        try:
+            filled: dict[str, str] = {}
+            for oid in exit_ids:
+                o = await self.client.get_order(id=UUID(str(oid)))
+                status = (getattr(o, "status", "") or "").upper()
+                filled[oid] = status
+            for oid, st in filled.items():
+                if st != "FILLED":
+                    continue
+                eo = self.state.get("exit_orders") or {}
+                if oid == eo.get("sl"):
+                    return "SL"
+                if oid == eo.get("tp"):
+                    return "TP"
+                # fallback if state is missing mapping
+                return "TP"
+            return None
+        except Exception:
+            return None
+
+    async def _detect_close_reason_from_recent_orders(self) -> Optional[str]:
+        """
+        Fallback close-reason detector.
+
+        Sometimes state can lose exit ids (e.g. restart, manual cancels, etc.). To still detect SL,
+        we look at the most recent FILLED reduce-only stop orders for this product and (if present)
+        match against our last known OCO group id.
+        """
+        if not self.subaccount_id or not self.product_id:
+            return None
+        try:
+            orders = await self.client.list_orders(
+                subaccount_id=str(self.subaccount_id),
+                product_ids=[str(self.product_id)],
+                limit=100,
+                order="desc",
+                order_by="createdAt",
+            )
+        except Exception:
+            return None
+        if not orders:
+            return None
+
+        want_group = str(self.state.get("exit_group_id") or "")
+        for o in orders:
+            try:
+                status = (getattr(o, "status", "") or "").upper()
+                if status != "FILLED":
+                    continue
+                # match group if we have it (preferred)
+                og = str(getattr(o, "group_id", "") or getattr(o, "groupId", "") or "")
+                if want_group and og and og != want_group:
+                    continue
+                reduce_only = bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False))
+                if not reduce_only:
+                    continue
+                st = getattr(o, "stop_type", None)
+                stv = getattr(st, "value", st)
+                try:
+                    stv_int = int(stv)
+                except Exception:
+                    stv_int = None
+                # stop_type: 0=GAIN (TP), 1=LOSS (SL)
+                if stv_int == 1:
+                    return "SL"
+                if stv_int == 0:
+                    return "TP"
+            except Exception:
+                continue
+        return None
+
+    async def _check_and_handle_exit_fills(
+        self,
+        vwap: Decimal,
+        entry_px: Decimal,
+        tp_px: Decimal,
+        sl_px: Decimal,
+    ) -> bool:
+        """
+        Check current OCO exit orders recorded in state and handle a fill immediately.
+
+        This is more reliable than position-based detection because a position can open+close
+        between polling intervals, while the FILLED order remains queryable.
+
+        Returns True if we handled a fill (and caller should stop further actions this step).
+        """
+        exit_ids = list(self.state.get("exit_order_ids") or [])
+        if not exit_ids:
+            return False
+
+        reason = await self._detect_close_reason(exit_ids)
+        if not reason:
+            # If both exits are no longer working (stale ids), clear them to avoid blocking entries forever.
+            try:
+                statuses = [await self._confirm_order_status(str(oid)) for oid in exit_ids]
+                if statuses and all(self._is_terminal_status(s) and (s or "").upper() != "FILLED" for s in statuses):
+                    await self._cancel_exits()
+                    self._save_state()
+            except Exception:
+                pass
+            return False
+
+        # Exit filled: cancel leftovers and record close reason.
+        await self._cancel_exits()
+        await self._cancel_entry()
+        self.state["last_close_reason"] = reason
+        self.state["last_close_at"] = _utc_now().isoformat()
+
+        if reason == "SL" and self.cfg.pause_on_sl:
+            self.state["trading_paused"] = True
+            self.state["pause_reason"] = "SL"
+            self.state["paused_at"] = _utc_now().isoformat()
+            self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
+            self._save_state()
+            logger.warning(
+                "PAUSED: stop-loss detected from exit order fill. vwap=%s entry=%s tp=%s sl=%s resume_at=%s",
+                str(vwap),
+                str(entry_px),
+                str(tp_px),
+                str(sl_px),
+                self.state.get("pause_release_price"),
+            )
+            return True
+
+        self._save_state()
+        logger.info(
+            "Position closed by %s (from exit order fill). vwap=%s entry=%s tp=%s sl=%s",
+            reason,
+            str(vwap),
+            str(entry_px),
+            str(tp_px),
+            str(sl_px),
+        )
+        return False
+
+    def _pause_released(self, price: Decimal, vwap: Decimal) -> bool:
+        if not self.state.get("trading_paused"):
+            return True
+        if not (price == price) or price <= 0 or not (vwap == vwap) or vwap <= 0:
+            return False
+
+        # Prefer a fixed target saved at SL time; otherwise derive from current VWAP.
+        tgt_raw = self.state.get("pause_release_price")
+        if tgt_raw is not None:
+            try:
+                target = _as_decimal(tgt_raw)
+            except Exception:
+                target = Decimal("NaN")
+        else:
+            target = self._opposite_entry_level(vwap)
+
+        if not (target == target) or target <= 0:
+            return False
+
+        # After SL:
+        # - LONG strategy: wait for price to touch SHORT entry (above VWAP) => price >= target
+        # - SHORT strategy: wait for price to touch LONG entry (below VWAP) => price <= target
+        if self.direction == "LONG":
+            return price >= target
+        return price <= target
+
+    async def step(self) -> None:
+        assert self.subaccount_id is not None and self.product_id is not None
+
+        now = _utc_now()
+        now_ms = _dt_to_ms(now)
+
+        # Anchor-based VWAP (like original).
+        anchor_start = self._anchor_start(now)
+        anchor_start_ms = _dt_to_ms(anchor_start)
+        prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
+        if prev_anchor != anchor_start_ms:
+            # Reset VWAP accumulators for new anchor period
+            self.state["last_anchor_start_ms"] = anchor_start_ms
+            self.state["cum_pq"] = "0"
+            self.state["cum_q"] = "0"
+            self.state["last_trade_ts"] = anchor_start_ms
+            self._save_state()
+            await self._cancel_entry()
+            await self._cancel_exits()
+            logger.info("New anchor period: %s", anchor_start.isoformat())
+
+        # Candle boundary (timeframe) for "full refresh" logic (like original).
+        tf_ms = self._timeframe_ms(self.cfg.timeframe)
+        candle_start_ms = now_ms - (now_ms % tf_ms)
+        is_new_candle = int(self.state.get("last_candle_start_ms") or 0) != candle_start_ms
+        if is_new_candle:
+            self.state["last_candle_start_ms"] = candle_start_ms
+            self._save_state()
+            logger.info("NEW CANDLE %s — full refresh", _ms_to_dt(candle_start_ms).isoformat())
+
+        price = await self.get_oracle_price()
+        vwap = await self._get_vwap(anchor_start_ms, now_ms)
+        entry_px, tp_px, sl_px = self._levels(vwap)
+
+        # Handle SL/TP fills even if position visibility lags.
+        handled = await self._check_and_handle_exit_fills(vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px)
+        if handled:
+            return
+
+        pos = await self._get_open_position()
+        pos_size = _as_decimal((pos or {}).get("size") or "0").copy_abs() if pos else Decimal("0")
+        has_pos = bool(pos and pos_size > 0)
+
+        # Persist last position size to detect transitions reliably.
+        prev_size = _as_decimal(self.state.get("last_position_size") or "0").copy_abs()
+        self.state["last_position_size"] = str(pos_size)
+        # NOTE: we save state only on meaningful events to avoid excessive writes.
+
+        # Handle pause-after-SL
+        if self.state.get("trading_paused"):
+            if self._pause_released(price, vwap):
+                self.state["trading_paused"] = False
+                self.state["pause_reason"] = None
+                self.state["paused_at"] = None
+                self.state["pause_release_price"] = None
+                self._save_state()
+                logger.warning("PAUSE cleared: resume condition met.")
+            else:
+                logger.info(
+                    "PAUSED: price=%s vwap=%s (waiting for opposite L1 touch)",
+                    str(price),
+                    str(vwap),
+                )
+                return
+
+        if not has_pos:
+            # Detect position close transition (prev>0 -> now==0) and decide pause reason.
+            closed_now = prev_size > 0 and pos_size <= 0
+
+            # If position is closed, clean exits and possibly set pause on SL
+            exit_ids = list(self.state.get("exit_order_ids") or [])
+            reason: Optional[str] = None
+            if closed_now:
+                # Prefer explicit exit ids; fallback to recent filled stop orders.
+                reason = await self._detect_close_reason(exit_ids) if exit_ids else None
+                if reason is None:
+                    reason = await self._detect_close_reason_from_recent_orders()
+
+            if exit_ids:
+                await self._cancel_exits()
+
+            if closed_now and reason:
+                self.state["last_close_reason"] = reason
+                self.state["last_close_at"] = _utc_now().isoformat()
+                self._save_state()
+
+            if closed_now and reason == "SL" and self.cfg.pause_on_sl:
+                # Cancel any working entry too; we don't want orders while paused.
+                await self._cancel_entry()
+                self.state["trading_paused"] = True
+                self.state["pause_reason"] = "SL"
+                self.state["paused_at"] = _utc_now().isoformat()
+                self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
+                self._save_state()
+                logger.warning(
+                    "PAUSED: stop-loss detected (reason=%s). vwap=%s entry=%s tp=%s sl=%s resume_at=%s",
+                    reason,
+                    str(vwap),
+                    str(entry_px),
+                    str(tp_px),
+                    str(sl_px),
+                    self.state.get("pause_release_price"),
+                )
+                return
+
+            # If we still have active exits recorded, do not place new entries (position visibility can lag).
+            if self.state.get("exit_order_ids"):
+                return
+
+            # On every new candle, re-place entry at fresh level (like original).
+            if is_new_candle:
+                await self._cancel_entry()
+                logger.info(
+                    "NEW CANDLE refresh: vwap=%s entry=%s tp=%s sl=%s (source=%s)",
+                    str(vwap),
+                    str(entry_px),
+                    str(tp_px),
+                    str(sl_px),
+                    str(self.cfg.vwap_source),
+                )
+            await self._ensure_entry_order(entry_px)
+            return
+
+        # Position exists:
+        # - Cancel stale entry if still recorded
+        if self.state.get("entry_order_id"):
+            await self._cancel_entry()
+            self._save_state()
+
+        # Ensure exits exist (OCO TP+SL). On each new candle we refresh exits to follow VWAP.
+        if is_new_candle:
+            await self._cancel_exits()
+        await self._ensure_oco_exits(pos, tp_px, sl_px)
+
+    async def run(self) -> None:
+        logger.info("Starting VWAP strategy: %s %s", self.direction, self.cfg.ticker)
+        while True:
+            try:
+                await self.step()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                logger.error("Loop error: %s", e)
+            await asyncio.sleep(int(self.cfg.poll_interval_sec))
+
+
+def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        trades_page_limit = int(raw.get("trades_page_limit", 200))
+        # clamp to API max
+        trades_page_limit = min(max(trades_page_limit, 1), 200)
+        return (
+            StrategyConfig(
+                ticker=str(raw.get("ticker", "SOLUSD")),
+                direction=str(raw.get("direction", "LONG")).upper(),
+                poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
+                timeframe=str(raw.get("timeframe", "1h")),
+                anchor_period=str(raw.get("anchor_period", "Session")),
+                entry_distance_long_pct=_as_decimal(raw.get("entry_distance_long_pct", "1.0")),
+                entry_distance_short_pct=_as_decimal(raw.get("entry_distance_short_pct", "1.5")),
+                entry_quantity=_as_decimal(raw.get("entry_quantity", "0.001")),
+                post_only=bool(raw.get("post_only", True)),
+                entry_expires_in_sec=int(raw.get("entry_expires_in_sec", 7 * 24 * 3600)),
+                tp_pct=_as_decimal(raw.get("tp_pct", "1.5")),
+                sl_pct=_as_decimal(raw.get("sl_pct", "4.0")),
+                exits_as_stop_market=bool(raw.get("exits_as_stop_market", True)),
+                exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
+                pause_on_sl=bool(raw.get("pause_on_sl", False)),
+                max_trade_pages=int(raw.get("max_trade_pages", 6)),
+                trades_page_limit=trades_page_limit,
+                vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
+                trade_overlap_ms=int(raw.get("trade_overlap_ms", 2000)),
+                trade_id_cache_size=int(raw.get("trade_id_cache_size", 5000)),
+                overflow_max_trade_pages=int(raw.get("overflow_max_trade_pages", 50)),
+                vwap_source=str(raw.get("vwap_source", "ethereal_trades")),
+                bybit_base_url=str(raw.get("bybit_base_url", "https://api.bybit.com")),
+                bybit_category=str(raw.get("bybit_category", "linear")),
+                bybit_symbol=str(raw.get("bybit_symbol", "SOLUSDT")),
+                bybit_kline_interval=str(raw.get("bybit_kline_interval", "1")),
+            ),
+            False,
+        )
+
+    cfg = StrategyConfig()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "ticker": cfg.ticker,
+                "direction": cfg.direction,
+                "poll_interval_sec": cfg.poll_interval_sec,
+                "timeframe": cfg.timeframe,
+                "anchor_period": cfg.anchor_period,
+                "entry_distance_long_pct": str(cfg.entry_distance_long_pct),
+                "entry_distance_short_pct": str(cfg.entry_distance_short_pct),
+                "entry_quantity": str(cfg.entry_quantity),
+                "post_only": cfg.post_only,
+                "entry_expires_in_sec": cfg.entry_expires_in_sec,
+                "tp_pct": str(cfg.tp_pct),
+                "sl_pct": str(cfg.sl_pct),
+                "exits_as_stop_market": cfg.exits_as_stop_market,
+                "exit_expires_in_sec": cfg.exit_expires_in_sec,
+                "pause_on_sl": cfg.pause_on_sl,
+                "max_trade_pages": cfg.max_trade_pages,
+                "trades_page_limit": cfg.trades_page_limit,
+                "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
+                "trade_overlap_ms": cfg.trade_overlap_ms,
+                "trade_id_cache_size": cfg.trade_id_cache_size,
+                "overflow_max_trade_pages": cfg.overflow_max_trade_pages,
+                "vwap_source": cfg.vwap_source,
+                "bybit_base_url": cfg.bybit_base_url,
+                "bybit_category": cfg.bybit_category,
+                "bybit_symbol": cfg.bybit_symbol,
+                "bybit_kline_interval": cfg.bybit_kline_interval,
+            },
+            f,
+            indent=2,
+        )
+    logger.info("Config created: %s (edit it and re-run)", path)
+    return cfg, True
+
+
+def _truthy_env(name: str) -> bool:
+    return (os.getenv(name, "") or "").strip().lower() in {"1", "true", "y", "yes", "on"}
+
+
+def _parse_csv_upper(s: str) -> list[str]:
+    return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
+
+
+def _strategy_config_from_json(raw: dict) -> StrategyConfig:
+    trades_page_limit = int(raw.get("trades_page_limit", 200))
+    trades_page_limit = min(max(trades_page_limit, 1), 200)  # clamp to API max
+    return StrategyConfig(
+        ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
+        direction=str(raw.get("direction", "LONG")).strip().upper(),
+        poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
+        timeframe=str(raw.get("timeframe", "1h")),
+        anchor_period=str(raw.get("anchor_period", "Session")),
+        entry_distance_long_pct=_as_decimal(raw.get("entry_distance_long_pct", "1.0")),
+        entry_distance_short_pct=_as_decimal(raw.get("entry_distance_short_pct", "1.5")),
+        entry_quantity=_as_decimal(raw.get("entry_quantity", "0.001")),
+        post_only=bool(raw.get("post_only", True)),
+        entry_expires_in_sec=int(raw.get("entry_expires_in_sec", 7 * 24 * 3600)),
+        tp_pct=_as_decimal(raw.get("tp_pct", "1.5")),
+        sl_pct=_as_decimal(raw.get("sl_pct", "4.0")),
+        exits_as_stop_market=bool(raw.get("exits_as_stop_market", True)),
+        exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
+        pause_on_sl=bool(raw.get("pause_on_sl", False)),
+        max_trade_pages=int(raw.get("max_trade_pages", 6)),
+        trades_page_limit=trades_page_limit,
+        vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
+        trade_overlap_ms=int(raw.get("trade_overlap_ms", 2000)),
+        trade_id_cache_size=int(raw.get("trade_id_cache_size", 5000)),
+        overflow_max_trade_pages=int(raw.get("overflow_max_trade_pages", 50)),
+        vwap_source=str(raw.get("vwap_source", "ethereal_trades")),
+        bybit_base_url=str(raw.get("bybit_base_url", "https://api.bybit.com")),
+        bybit_category=str(raw.get("bybit_category", "linear")),
+        bybit_symbol=str(raw.get("bybit_symbol", "SOLUSDT")),
+        bybit_kline_interval=str(raw.get("bybit_kline_interval", "1")),
+    )
+
+
+def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
+    return {
+        "ticker": cfg.ticker,
+        "direction": cfg.direction,
+        "poll_interval_sec": cfg.poll_interval_sec,
+        "timeframe": cfg.timeframe,
+        "anchor_period": cfg.anchor_period,
+        "entry_distance_long_pct": str(cfg.entry_distance_long_pct),
+        "entry_distance_short_pct": str(cfg.entry_distance_short_pct),
+        "entry_quantity": str(cfg.entry_quantity),
+        "post_only": cfg.post_only,
+        "entry_expires_in_sec": cfg.entry_expires_in_sec,
+        "tp_pct": str(cfg.tp_pct),
+        "sl_pct": str(cfg.sl_pct),
+        "exits_as_stop_market": cfg.exits_as_stop_market,
+        "exit_expires_in_sec": cfg.exit_expires_in_sec,
+        "pause_on_sl": cfg.pause_on_sl,
+        "max_trade_pages": cfg.max_trade_pages,
+        "trades_page_limit": cfg.trades_page_limit,
+        "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
+        "trade_overlap_ms": cfg.trade_overlap_ms,
+        "trade_id_cache_size": cfg.trade_id_cache_size,
+        "overflow_max_trade_pages": cfg.overflow_max_trade_pages,
+        "vwap_source": cfg.vwap_source,
+        "bybit_base_url": cfg.bybit_base_url,
+        "bybit_category": cfg.bybit_category,
+        "bybit_symbol": cfg.bybit_symbol,
+        "bybit_kline_interval": cfg.bybit_kline_interval,
+    }
+
+
+def _load_or_create_multi_config(path: str) -> tuple[list[StrategyConfig], int, bool]:
+    """
+    Multi-instrument config format:
+
+    {
+      "subaccount_index": 0,
+      "strategies": [
+        { ... StrategyConfig fields ... },
+        { ... }
+      ]
+    }
+    """
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f) or {}
+        sub_idx = int(raw.get("subaccount_index", 0))
+        items = raw.get("strategies") or []
+        cfgs = [_strategy_config_from_json(x or {}) for x in items]
+        # de-dupe accidental empty entries
+        cfgs = [c for c in cfgs if (c.ticker or "").strip()]
+        return cfgs, sub_idx, False
+
+    # Create a template file.
+    tickers = _parse_csv_upper(os.getenv("ETHEREAL_TICKERS", ""))
+    if not tickers:
+        tickers = [(os.getenv("ETHEREAL_TICKER") or "SOLUSD").strip().upper()]
+    sub_idx = int(os.getenv("ETHEREAL_SUBACCOUNT_INDEX", "0"))
+    template_cfgs: list[StrategyConfig] = []
+    for t in tickers:
+        c = StrategyConfig(ticker=t)
+        template_cfgs.append(c)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "subaccount_index": sub_idx,
+                "strategies": [_strategy_config_to_json(c) for c in template_cfgs],
+            },
+            f,
+            indent=2,
+        )
+    logger.info("Multi-config created: %s (edit it and re-run)", path)
+    return template_cfgs, sub_idx, True
+
+
+async def amain() -> None:
+    testnet = (os.getenv("ETHEREAL_TESTNET", "1").strip().lower() in {"1", "true", "y", "yes"})
+    network = "testnet" if testnet else "mainnet"
+    base_url = os.getenv("ETHEREAL_BASE_URL") or ("https://api.etherealtest.net" if testnet else "https://api.ethereal.trade")
+    rpc_url = os.getenv("ETHEREAL_RPC_URL") or ("https://rpc.etherealtest.net" if testnet else "https://rpc.ethereal.trade")
+    private_key = (os.getenv("ETHEREAL_PRIVATE_KEY") or "").strip()
+    if not private_key:
+        raise RuntimeError("Set ETHEREAL_PRIVATE_KEY (EVM private key) in env.")
+
+    client = await AsyncRESTClient.create(
+        {
+            "network": network,
+            "base_url": base_url,
+            "chain_config": {
+                "rpc_url": rpc_url,
+                "private_key": private_key,
+            },
+        }
+    )
+    try:
+        use_multi = os.path.exists(MULTI_CONFIG_FILE) or _truthy_env("ETHEREAL_MULTI") or bool(os.getenv("ETHEREAL_TICKERS"))
+
+        if use_multi:
+            cfgs, sub_idx_from_file, created = _load_or_create_multi_config(MULTI_CONFIG_FILE)
+            if created:
+                # Avoid continuing with defaults on first run (prevents confusing errors).
+                return
+            if not cfgs:
+                raise RuntimeError(f"{MULTI_CONFIG_FILE} has no strategies. Add at least 1 strategy and re-run.")
+
+            # allow env override (optional): apply to all strategies
+            if os.getenv("ETHEREAL_ENTRY_QTY"):
+                q = _as_decimal(os.getenv("ETHEREAL_ENTRY_QTY"))
+                cfgs = [StrategyConfig(**{**c.__dict__, "entry_quantity": q}) for c in cfgs]
+
+            sub_idx = int(os.getenv("ETHEREAL_SUBACCOUNT_INDEX", str(sub_idx_from_file)))
+
+            # Shared discovery to reduce API calls for multi-run.
+            subs = await client.subaccounts()
+            if not subs:
+                raise RuntimeError(
+                    "No subaccounts found for this key. On Ethereal, a subaccount is created only after you "
+                    "deposit USDe. Deposit (testnet: https://deposit.etherealtest.net, mainnet: https://deposit.ethereal.trade) "
+                    "then re-run the bot."
+                )
+            if sub_idx < 0 or sub_idx >= len(subs):
+                raise RuntimeError(f"subaccount_index={sub_idx} is out of range. Found {len(subs)} subaccounts.")
+            sub_id = subs[sub_idx].id
+            sub_name = subs[sub_idx].name
+
+            products = await client.products_by_ticker()
+
+            strategies: list[EtherealVWAPStrategy] = []
+            for i, cfg in enumerate(cfgs):
+                s = EtherealVWAPStrategy(client, cfg, subaccount_index=sub_idx)
+                try:
+                    await s.initialize(subaccount_id=sub_id, subaccount_name=sub_name, products_by_ticker=products)
+                except RuntimeError as e:
+                    logger.error("[%s %s] %s", cfg.direction, cfg.ticker, str(e))
+                    continue
+                strategies.append(s)
+                # Small stagger to reduce bursts when many symbols start together.
+                await asyncio.sleep(0.15 * i)
+
+            if not strategies:
+                raise RuntimeError("All strategies failed to initialize. Check tickers and config.")
+
+            logger.info("Starting %d strategies in parallel.", len(strategies))
+            await asyncio.gather(*(s.run() for s in strategies))
+            return
+
+        # Single-instrument mode (backward compatible)
+        ticker = (os.getenv("ETHEREAL_TICKER") or "SOLUSD").strip().upper()
+        direction = (os.getenv("ETHEREAL_DIRECTION") or "LONG").strip().upper()
+        config_path = f"strategy_config_{direction}_{ticker}.json"
+        cfg, created = _load_or_create_config(config_path)
+        if created:
+            return
+
+        # allow env overrides (optional)
+        if os.getenv("ETHEREAL_ENTRY_QTY"):
+            cfg = StrategyConfig(**{**cfg.__dict__, "entry_quantity": _as_decimal(os.getenv("ETHEREAL_ENTRY_QTY"))})
+
+        sub_idx = int(os.getenv("ETHEREAL_SUBACCOUNT_INDEX", "0"))
+        strat = EtherealVWAPStrategy(client, cfg, subaccount_index=sub_idx)
+        try:
+            await strat.initialize()
+        except RuntimeError as e:
+            logger.error(str(e))
+            return
+        await strat.run()
+    finally:
+        await client.close()
+
+
+def main() -> None:
+    try:
+        asyncio.run(amain())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+
+
+if __name__ == "__main__":
+    main()
+
