@@ -89,6 +89,7 @@ Edit it to change:
 - `anchor_open_min_vwap_delta_pct` — минимальная разница в % между VWAP старого и первого VWAP нового анкера, чтобы открыть сделку
 - `anchor_open_sl_pct_of_tp` — стоп‑лосс в % от размера тейк‑профита (TP size = |first_vwap_new - last_vwap_old|)
 - `anchor_open_close_on_anchor_end` (true/false) — закрывать позицию по рынку в конце анкера
+- `anchor_open_use_oracle_if_no_vwap` (true/false) — если VWAP нового анкера ещё NaN (нет трейдов), использовать oracle price как “первый VWAP”
 - `max_trade_pages` / `trades_page_limit` — сколько публичных трейдов сканировать для VWAP (на сильной волатильности увеличивайте)
 - `trade_overlap_ms` / `trade_id_cache_size` / `overflow_max_trade_pages` — защита от “пропусков” трейдов при резких разлетах
 - `vwap_source` — источник данных для VWAP (`ethereal_trades` или `bybit_klines`)
