@@ -84,7 +84,7 @@ Edit it to change:
 - `entry_expires_in_sec` / `exit_expires_in_sec`
 - `tp_pct` / `sl_pct`
 - `anchor_period` (Session/Week/Month/Year/Hour/2 Hours/4 Hours/8 Hours/12 Hours)
-- `pause_on_sl` (true/false) — если true, то после SL бот ставит торговлю на паузу до касания противоположного entry-уровня
+- `pause_after_sl_minutes` (0/число минут) — пауза после SL на заданное время (в минутах). 0 = выключено
 - `max_trade_pages` / `trades_page_limit` — сколько публичных трейдов сканировать для VWAP (на сильной волатильности увеличивайте)
 - `trade_overlap_ms` / `trade_id_cache_size` / `overflow_max_trade_pages` — защита от “пропусков” трейдов при резких разлетах
 - `vwap_source` — источник данных для VWAP (`ethereal_trades` или `bybit_klines`)

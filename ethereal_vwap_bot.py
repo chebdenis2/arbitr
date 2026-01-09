@@ -72,6 +72,9 @@ class StrategyConfig:
 
     # Safety
     pause_on_sl: bool = False
+    # New pause model (recommended): pause trading for N minutes after SL.
+    # If 0 -> disabled (unless pause_on_sl=true, which enables a default pause as backward compatibility).
+    pause_after_sl_minutes: int = 0
     max_trade_pages: int = 6  # VWAP from public trades: pages*limit trades
     trades_page_limit: int = 200  # API constraint: max 200
     vwap_recalc_threshold: Decimal = Decimal("0.0005")  # 0.05% like original bot
@@ -194,8 +197,12 @@ class EtherealVWAPStrategy:
         self.state.setdefault("trading_paused", False)
         self.state.setdefault("pause_reason", None)
         self.state.setdefault("paused_at", None)
-        # If trading is paused, we can persist a fixed resume level to avoid "moving target"
-        # due to VWAP changing while paused.
+        # Pause timer (new model): pause_until_ts is a unix timestamp (seconds).
+        self.state.setdefault("pause_until_ts", 0)
+        self.state.setdefault("pause_duration_min", 0)
+        # Throttle pause logs.
+        self.state.setdefault("pause_last_log_ms", 0)
+        # Backward-compat state key from old pause model (price-touch). Kept for safe migration.
         self.state.setdefault("pause_release_price", None)
         self.state.setdefault("last_anchor_start_ms", 0)
         self.state.setdefault("last_candle_start_ms", 0)
@@ -986,21 +993,12 @@ class EtherealVWAPStrategy:
         self.state["last_close_reason"] = reason
         self.state["last_close_at"] = _utc_now().isoformat()
 
-        if reason == "SL" and self.cfg.pause_on_sl:
-            self.state["trading_paused"] = True
-            self.state["pause_reason"] = "SL"
-            self.state["paused_at"] = _utc_now().isoformat()
-            self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
-            self._save_state()
-            logger.warning(
-                "PAUSED: stop-loss detected from exit order fill. vwap=%s entry=%s tp=%s sl=%s resume_at=%s",
-                str(vwap),
-                str(entry_px),
-                str(tp_px),
-                str(sl_px),
-                self.state.get("pause_release_price"),
-            )
-            return True
+        if reason == "SL":
+            pause_min = self._pause_after_sl_minutes()
+            if pause_min > 0:
+                await self._cancel_entry()
+                self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source="exit_fill")
+                return True
 
         self._save_state()
         logger.info(
@@ -1013,31 +1011,91 @@ class EtherealVWAPStrategy:
         )
         return False
 
-    def _pause_released(self, price: Decimal, vwap: Decimal) -> bool:
-        if not self.state.get("trading_paused"):
+    def _pause_after_sl_minutes(self) -> int:
+        """
+        Returns pause duration in minutes after SL.
+
+        New model: cfg.pause_after_sl_minutes (preferred).
+        Backward compatibility: if cfg.pause_on_sl is true and pause_after_sl_minutes<=0 -> default to 60 minutes.
+        """
+        try:
+            m = int(getattr(self.cfg, "pause_after_sl_minutes", 0) or 0)
+        except Exception:
+            m = 0
+        if m > 0:
+            return m
+        if bool(getattr(self.cfg, "pause_on_sl", False)):
+            return 60
+        return 0
+
+    def _set_pause_after_sl(
+        self,
+        minutes: int,
+        *,
+        vwap: Decimal,
+        entry_px: Decimal,
+        tp_px: Decimal,
+        sl_px: Decimal,
+        source: str,
+    ) -> None:
+        minutes = max(0, int(minutes))
+        if minutes <= 0:
+            return
+        now = _utc_now()
+        now_ts = int(now.timestamp())
+        until_ts = now_ts + minutes * 60
+
+        self.state["trading_paused"] = True
+        self.state["pause_reason"] = "SL_TIMER"
+        self.state["paused_at"] = now.isoformat()
+        self.state["pause_until_ts"] = int(until_ts)
+        self.state["pause_duration_min"] = int(minutes)
+        self.state["pause_last_log_ms"] = 0
+        # Clear old pause model target to avoid confusion.
+        self.state["pause_release_price"] = None
+        self._save_state()
+
+        logger.warning(
+            "PAUSED after SL (%s): %s %s for %s min until %s. vwap=%s entry=%s tp=%s sl=%s",
+            source,
+            self.direction,
+            self.cfg.ticker,
+            minutes,
+            _ms_to_dt(until_ts * 1000).isoformat(),
+            str(vwap),
+            str(entry_px),
+            str(tp_px),
+            str(sl_px),
+        )
+
+    def _pause_expired(self, now_ts: int) -> bool:
+        until_ts = int(self.state.get("pause_until_ts") or 0)
+        if until_ts <= 0:
+            # If we have a pause flag without a deadline (legacy/corrupted state), auto-clear it.
             return True
-        if not (price == price) or price <= 0 or not (vwap == vwap) or vwap <= 0:
-            return False
+        return now_ts >= until_ts
 
-        # Prefer a fixed target saved at SL time; otherwise derive from current VWAP.
-        tgt_raw = self.state.get("pause_release_price")
-        if tgt_raw is not None:
-            try:
-                target = _as_decimal(tgt_raw)
-            except Exception:
-                target = Decimal("NaN")
-        else:
-            target = self._opposite_entry_level(vwap)
+    def _log_pause_status(self, now_ms: int) -> None:
+        """
+        Log pause details with throttling (about once per minute).
+        """
+        last_ms = int(self.state.get("pause_last_log_ms") or 0)
+        if last_ms and (now_ms - last_ms) < 60_000:
+            return
+        self.state["pause_last_log_ms"] = int(now_ms)
+        self._save_state()
 
-        if not (target == target) or target <= 0:
-            return False
-
-        # After SL:
-        # - LONG strategy: wait for price to touch SHORT entry (above VWAP) => price >= target
-        # - SHORT strategy: wait for price to touch LONG entry (below VWAP) => price <= target
-        if self.direction == "LONG":
-            return price >= target
-        return price <= target
+        until_ts = int(self.state.get("pause_until_ts") or 0)
+        now_ts = int(now_ms / 1000)
+        remaining = max(0, until_ts - now_ts) if until_ts > 0 else 0
+        logger.info(
+            "PAUSED: %s %s reason=%s remaining=%ss until=%s",
+            self.direction,
+            self.cfg.ticker,
+            str(self.state.get("pause_reason") or ""),
+            int(remaining),
+            (_ms_to_dt(until_ts * 1000).isoformat() if until_ts > 0 else "unknown"),
+        )
 
     async def step(self) -> None:
         assert self.subaccount_id is not None and self.product_id is not None
@@ -1087,21 +1145,22 @@ class EtherealVWAPStrategy:
         self.state["last_position_size"] = str(pos_size)
         # NOTE: we save state only on meaningful events to avoid excessive writes.
 
-        # Handle pause-after-SL
+        # Handle pause-after-SL (timer model)
         if self.state.get("trading_paused"):
-            if self._pause_released(price, vwap):
+            now_ts = int(now.timestamp())
+            if self._pause_expired(now_ts):
+                # Clear pause and resume.
                 self.state["trading_paused"] = False
                 self.state["pause_reason"] = None
                 self.state["paused_at"] = None
+                self.state["pause_until_ts"] = 0
+                self.state["pause_duration_min"] = 0
+                self.state["pause_last_log_ms"] = 0
                 self.state["pause_release_price"] = None
                 self._save_state()
-                logger.warning("PAUSE cleared: resume condition met.")
+                logger.warning("PAUSE cleared: %s %s resumed.", self.direction, self.cfg.ticker)
             else:
-                logger.info(
-                    "PAUSED: price=%s vwap=%s (waiting for opposite L1 touch)",
-                    str(price),
-                    str(vwap),
-                )
+                self._log_pause_status(now_ms)
                 return
 
         if not has_pos:
@@ -1125,24 +1184,13 @@ class EtherealVWAPStrategy:
                 self.state["last_close_at"] = _utc_now().isoformat()
                 self._save_state()
 
-            if closed_now and reason == "SL" and self.cfg.pause_on_sl:
-                # Cancel any working entry too; we don't want orders while paused.
-                await self._cancel_entry()
-                self.state["trading_paused"] = True
-                self.state["pause_reason"] = "SL"
-                self.state["paused_at"] = _utc_now().isoformat()
-                self.state["pause_release_price"] = str(self._opposite_entry_level(vwap))
-                self._save_state()
-                logger.warning(
-                    "PAUSED: stop-loss detected (reason=%s). vwap=%s entry=%s tp=%s sl=%s resume_at=%s",
-                    reason,
-                    str(vwap),
-                    str(entry_px),
-                    str(tp_px),
-                    str(sl_px),
-                    self.state.get("pause_release_price"),
-                )
-                return
+            if closed_now and reason == "SL":
+                pause_min = self._pause_after_sl_minutes()
+                if pause_min > 0:
+                    # Cancel any working entry too; we don't want orders while paused.
+                    await self._cancel_entry()
+                    self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source="position_close")
+                    return
 
             # If we still have active exits recorded, do not place new entries (position visibility can lag).
             if self.state.get("exit_order_ids"):
@@ -1209,6 +1257,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 exits_as_stop_market=bool(raw.get("exits_as_stop_market", True)),
                 exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
                 pause_on_sl=bool(raw.get("pause_on_sl", False)),
+                pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
                 max_trade_pages=int(raw.get("max_trade_pages", 6)),
                 trades_page_limit=trades_page_limit,
                 vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
@@ -1243,6 +1292,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "exits_as_stop_market": cfg.exits_as_stop_market,
                 "exit_expires_in_sec": cfg.exit_expires_in_sec,
                 "pause_on_sl": cfg.pause_on_sl,
+                "pause_after_sl_minutes": cfg.pause_after_sl_minutes,
                 "max_trade_pages": cfg.max_trade_pages,
                 "trades_page_limit": cfg.trades_page_limit,
                 "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
@@ -1289,6 +1339,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         exits_as_stop_market=bool(raw.get("exits_as_stop_market", True)),
         exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
         pause_on_sl=bool(raw.get("pause_on_sl", False)),
+        pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
         max_trade_pages=int(raw.get("max_trade_pages", 6)),
         trades_page_limit=trades_page_limit,
         vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
@@ -1320,6 +1371,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "exits_as_stop_market": cfg.exits_as_stop_market,
         "exit_expires_in_sec": cfg.exit_expires_in_sec,
         "pause_on_sl": cfg.pause_on_sl,
+        "pause_after_sl_minutes": int(getattr(cfg, "pause_after_sl_minutes", 0) or 0),
         "max_trade_pages": cfg.max_trade_pages,
         "trades_page_limit": cfg.trades_page_limit,
         "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
