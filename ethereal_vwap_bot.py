@@ -49,6 +49,11 @@ def _quantize_down(x: Decimal, step: Decimal) -> Decimal:
 
 @dataclass(frozen=True)
 class StrategyConfig:
+    # Strategy selection:
+    # - "vwap" (default): existing logic (limit entry at VWAP ± distance + OCO exits)
+    # - "anchor_open": new logic (market entry on new anchor + TP to last VWAP of prev anchor + SL from TP size + close at anchor end)
+    strategy: str = "vwap"
+
     ticker: str = "SOLUSD"
     direction: str = "LONG"  # LONG|SHORT
     poll_interval_sec: int = 3
@@ -75,6 +80,19 @@ class StrategyConfig:
     # New pause model (recommended): pause trading for N minutes after SL.
     # If 0 -> disabled (unless pause_on_sl=true, which enables a default pause as backward compatibility).
     pause_after_sl_minutes: int = 0
+
+    # ---------------------------
+    # Strategy: anchor_open
+    # ---------------------------
+    # Open trade only if abs(delta VWAP) >= threshold (%), where:
+    #   delta_pct = abs((first_vwap_new_anchor - last_vwap_prev_anchor) / last_vwap_prev_anchor) * 100
+    anchor_open_min_vwap_delta_pct: Decimal = Decimal("0")
+    # Stop-loss size as % of TP size, where:
+    #   tp_size = abs(first_vwap_new_anchor - last_vwap_prev_anchor)
+    anchor_open_sl_pct_of_tp: Decimal = Decimal("100")
+    # Close any open position at anchor end (recommended).
+    anchor_open_close_on_anchor_end: bool = True
+
     max_trade_pages: int = 6  # VWAP from public trades: pages*limit trades
     trades_page_limit: int = 200  # API constraint: max 200
     vwap_recalc_threshold: Decimal = Decimal("0.0005")  # 0.05% like original bot
@@ -216,6 +234,22 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_position_size", "0")
         self.state.setdefault("last_close_reason", None)
         self.state.setdefault("last_close_at", None)
+
+        # Anchor-open strategy state
+        self.state.setdefault("prev_anchor_vwap", None)  # str Decimal
+        self.state.setdefault("prev_anchor_start_ms", 0)
+        self.state.setdefault("anchor_open_first_vwap", None)  # str Decimal
+        self.state.setdefault("anchor_open_first_vwap_ms", 0)
+        self.state.setdefault("anchor_open_decision_anchor_ms", 0)  # anchor_start_ms where decision (opened/skipped) was made
+        self.state.setdefault("anchor_open_active", False)
+        self.state.setdefault("anchor_open_direction", None)  # LONG|SHORT
+        self.state.setdefault("anchor_open_tp_price", None)  # str Decimal (last VWAP prev anchor)
+        self.state.setdefault("anchor_open_sl_price", None)  # str Decimal
+        self.state.setdefault("anchor_open_tp_size", None)  # str Decimal
+        self.state.setdefault("anchor_open_delta_pct", None)  # str Decimal
+        self.state.setdefault("anchor_open_opened_at", None)
+        self.state.setdefault("anchor_open_closed_at", None)
+        self.state.setdefault("anchor_open_close_reason", None)  # TP|SL|ANCHOR_END|MANUAL|UNKNOWN
 
     def _save_state(self) -> None:
         with open(self.state_file, "w", encoding="utf-8") as f:
@@ -817,7 +851,7 @@ class EtherealVWAPStrategy:
                     "is allowed to trade on this subaccount. Linked signers are only needed if trading via a separate signer."
                 )
 
-    async def _ensure_oco_exits(self, pos: dict, tp_px: Decimal, sl_px: Decimal) -> None:
+    async def _ensure_oco_exits(self, pos: dict, tp_px: Decimal, sl_px: Decimal, *, direction: Optional[str] = None) -> None:
         if self.state.get("exit_order_ids"):
             return
 
@@ -826,8 +860,12 @@ class EtherealVWAPStrategy:
         if qty <= 0:
             return
 
+        d = (direction or self.direction or "LONG").strip().upper()
+        if d not in {"LONG", "SHORT"}:
+            d = self.direction
+
         # Close direction
-        exit_side = 1 if self.direction == "LONG" else 0
+        exit_side = 1 if d == "LONG" else 0
         group_id = str(uuid.uuid4())
 
         # stop_type: 0=GAIN (TP), 1=LOSS (SL)
@@ -993,6 +1031,10 @@ class EtherealVWAPStrategy:
         self.state["last_close_reason"] = reason
         self.state["last_close_at"] = _utc_now().isoformat()
 
+        # If anchor_open strategy trade was active, mark it closed.
+        if self.state.get("anchor_open_active"):
+            self._clear_anchor_open_state(reason=reason)
+
         if reason == "SL":
             pause_min = self._pause_after_sl_minutes()
             if pause_min > 0:
@@ -1010,6 +1052,236 @@ class EtherealVWAPStrategy:
             str(sl_px),
         )
         return False
+
+    def _cfg_strategy(self) -> str:
+        s = (getattr(self.cfg, "strategy", None) or "vwap").strip().lower()
+        if s in {"anchor", "anchoropen", "anchor_open", "anchor-open"}:
+            return "anchor_open"
+        if s in {"vwap", "vwap_entry", "vwap-limit", "vwap_limit"}:
+            return "vwap"
+        return s or "vwap"
+
+    def _clear_anchor_open_state(self, *, reason: str) -> None:
+        self.state["anchor_open_active"] = False
+        self.state["anchor_open_closed_at"] = _utc_now().isoformat()
+        self.state["anchor_open_close_reason"] = str(reason or "UNKNOWN")
+        self.state["anchor_open_direction"] = None
+        self.state["anchor_open_tp_price"] = None
+        self.state["anchor_open_sl_price"] = None
+        self.state["anchor_open_tp_size"] = None
+        self.state["anchor_open_delta_pct"] = None
+        self.state["anchor_open_opened_at"] = None
+        # Keep prev_anchor_vwap for next anchor.
+        self._save_state()
+
+    def _vwap_from_accumulators(self) -> Optional[Decimal]:
+        try:
+            q = _as_decimal(self.state.get("cum_q") or "0")
+            if q <= 0:
+                return None
+            pq = _as_decimal(self.state.get("cum_pq") or "0")
+            return pq / q
+        except Exception:
+            return None
+
+    async def _place_market_order(self, *, side: int, qty: Decimal, reduce_only: bool, tag: str) -> Optional[str]:
+        if qty <= 0:
+            return None
+        try:
+            sender = getattr(getattr(self.client, "chain", None), "address", None)
+            o = await self.client.create_order(
+                order_type="MARKET",
+                product_id=self.product_id,
+                ticker=self.cfg.ticker,
+                side=int(side),
+                quantity=float(qty),
+                reduce_only=bool(reduce_only),
+                sender=sender,
+                subaccount=self.subaccount_name,
+                client_order_id=self._mk_client_order_id(tag),
+            )
+            oid = str(getattr(o, "id", "") or "")
+            result = self._result_value(getattr(o, "result", "") or "")
+            if result and result.strip().lower() != "ok":
+                logger.error("%s MARKET rejected: result=%s qty=%s", tag, result, qty)
+                return None
+            if not oid:
+                logger.error("%s MARKET returned empty order id (result=%s)", tag, result or "UNKNOWN")
+                return None
+            return oid
+        except Exception as e:
+            logger.error("%s MARKET failed: %r", tag, e)
+            return None
+
+    async def _close_position_market(self, *, direction: str, pos: dict, reason: str) -> None:
+        """
+        Close full position by market with reduce_only=True.
+        direction is the trade direction (LONG|SHORT) we are closing.
+        """
+        size = _as_decimal(pos.get("size") or "0").copy_abs()
+        qty = self._round_qty(size)
+        if qty <= 0:
+            return
+        d = (direction or "").strip().upper()
+        exit_side = 1 if d == "LONG" else 0
+        oid = await self._place_market_order(side=exit_side, qty=qty, reduce_only=True, tag="X")
+        if oid:
+            logger.warning("CLOSE by market: %s %s qty=%s reason=%s (order_id=%s)", d, self.cfg.ticker, qty, reason, oid)
+
+    async def _anchor_open_step(
+        self,
+        *,
+        now: datetime,
+        now_ms: int,
+        anchor_start_ms: int,
+        prev_anchor_ms: int,
+        vwap: Decimal,
+        pos: Optional[dict],
+        has_pos: bool,
+    ) -> None:
+        """
+        Strategy "anchor_open":
+        - On new anchor: (optionally) close existing position at anchor end.
+        - Once first VWAP of new anchor is available: decide to open based on VWAP delta threshold.
+        - Entry is MARKET.
+        - TP = last VWAP of previous anchor.
+        - SL distance = TP distance * anchor_open_sl_pct_of_tp.
+        - If anchor ends and position still open: close by MARKET.
+        """
+        # 1) If anchor changed and we have an active anchor_open trade, close it at anchor end.
+        if prev_anchor_ms and prev_anchor_ms != anchor_start_ms and bool(self.state.get("anchor_open_active")):
+            if bool(getattr(self.cfg, "anchor_open_close_on_anchor_end", True)) and has_pos and pos:
+                d = str(self.state.get("anchor_open_direction") or "").upper() or "LONG"
+                await self._cancel_exits()
+                await self._close_position_market(direction=d, pos=pos, reason="ANCHOR_END")
+            self._clear_anchor_open_state(reason="ANCHOR_END")
+
+        # 2) If we have a position, ensure exits exist using stored TP/SL.
+        if has_pos and pos:
+            if not self.state.get("exit_order_ids"):
+                try:
+                    tp = _as_decimal(self.state.get("anchor_open_tp_price"))
+                    sl = _as_decimal(self.state.get("anchor_open_sl_price"))
+                    d = str(self.state.get("anchor_open_direction") or "").upper() or "LONG"
+                except Exception:
+                    tp = Decimal("NaN")
+                    sl = Decimal("NaN")
+                    d = "LONG"
+                if (tp == tp) and tp > 0 and (sl == sl) and sl > 0:
+                    await self._ensure_oco_exits(pos, self._round_price(tp), self._round_price(sl), direction=d)
+            return
+
+        # 3) If no position and no active trade, decide once per anchor.
+        decision_anchor = int(self.state.get("anchor_open_decision_anchor_ms") or 0)
+        if decision_anchor == int(anchor_start_ms):
+            return
+
+        prev_vwap_raw = self.state.get("prev_anchor_vwap")
+        if prev_vwap_raw is None:
+            return
+        try:
+            prev_vwap = _as_decimal(prev_vwap_raw)
+        except Exception:
+            return
+        if not (prev_vwap == prev_vwap) or prev_vwap <= 0:
+            return
+
+        # Capture first VWAP of this anchor (once VWAP becomes valid).
+        if self.state.get("anchor_open_first_vwap") is None:
+            if not (vwap == vwap) or vwap <= 0:
+                logger.info("ANCHOR_OPEN: waiting for first VWAP of new anchor (%s %s)", self.cfg.ticker, self.cfg.anchor_period)
+                return
+            self.state["anchor_open_first_vwap"] = str(vwap)
+            self.state["anchor_open_first_vwap_ms"] = int(now_ms)
+            self._save_state()
+
+        try:
+            first_vwap = _as_decimal(self.state.get("anchor_open_first_vwap"))
+        except Exception:
+            return
+        if not (first_vwap == first_vwap) or first_vwap <= 0:
+            return
+
+        delta = (first_vwap - prev_vwap)
+        if delta == 0:
+            self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
+            self._save_state()
+            logger.info("ANCHOR_OPEN skip: delta=0 (prev_vwap=%s first_vwap=%s)", str(prev_vwap), str(first_vwap))
+            return
+
+        delta_pct = (delta.copy_abs() / prev_vwap) * Decimal("100")
+        thr = _as_decimal(getattr(self.cfg, "anchor_open_min_vwap_delta_pct", Decimal("0")) or "0")
+        if thr < 0:
+            thr = Decimal("0")
+        if delta_pct < thr:
+            self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
+            self.state["anchor_open_delta_pct"] = str(delta_pct)
+            self._save_state()
+            logger.info(
+                "ANCHOR_OPEN skip: delta_pct=%s < thr=%s (prev_vwap=%s first_vwap=%s)",
+                str(delta_pct),
+                str(thr),
+                str(prev_vwap),
+                str(first_vwap),
+            )
+            return
+
+        # Direction: if new VWAP > old VWAP => SHORT (to TP down to old VWAP). Else LONG.
+        trade_dir = "SHORT" if first_vwap > prev_vwap else "LONG"
+        side = 0 if trade_dir == "LONG" else 1
+
+        # TP and SL based on VWAPs (reference).
+        tp_price = prev_vwap
+        tp_size = (first_vwap - prev_vwap).copy_abs()
+        if tp_size <= 0:
+            self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
+            self._save_state()
+            return
+
+        sl_pct_of_tp = _as_decimal(getattr(self.cfg, "anchor_open_sl_pct_of_tp", Decimal("100")) or "100")
+        if sl_pct_of_tp < 0:
+            sl_pct_of_tp = Decimal("0")
+        sl_size = tp_size * (sl_pct_of_tp / Decimal("100"))
+        # Stop is placed around the entry reference (first_vwap).
+        sl_price = (first_vwap - sl_size) if trade_dir == "LONG" else (first_vwap + sl_size)
+
+        qty = self._round_qty(self.cfg.entry_quantity)
+        if qty <= 0:
+            self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
+            self._save_state()
+            logger.error("ANCHOR_OPEN: qty<=0; check entry_quantity")
+            return
+
+        oid = await self._place_market_order(side=side, qty=qty, reduce_only=False, tag="E")
+        if not oid:
+            return
+
+        self.state["anchor_open_active"] = True
+        self.state["anchor_open_direction"] = trade_dir
+        self.state["anchor_open_tp_price"] = str(tp_price)
+        self.state["anchor_open_sl_price"] = str(sl_price)
+        self.state["anchor_open_tp_size"] = str(tp_size)
+        self.state["anchor_open_delta_pct"] = str(delta_pct)
+        self.state["anchor_open_opened_at"] = now.isoformat()
+        self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
+        self._save_state()
+
+        logger.warning(
+            "ANCHOR_OPEN ENTRY: %s %s qty=%s (order_id=%s) prev_vwap=%s first_vwap=%s delta_pct=%s thr=%s TP=%s SL=%s sl_pct_of_tp=%s tp_size=%s",
+            trade_dir,
+            self.cfg.ticker,
+            qty,
+            oid,
+            str(prev_vwap),
+            str(first_vwap),
+            str(delta_pct),
+            str(thr),
+            str(self._round_price(tp_price)),
+            str(self._round_price(sl_price)),
+            str(sl_pct_of_tp),
+            str(tp_size),
+        )
+
 
     def _pause_after_sl_minutes(self) -> int:
         """
@@ -1108,6 +1380,17 @@ class EtherealVWAPStrategy:
         anchor_start_ms = _dt_to_ms(anchor_start)
         prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
         if prev_anchor != anchor_start_ms:
+            # Persist last VWAP of previous anchor (used by anchor_open strategy).
+            prev_vwap = self._vwap_from_accumulators()
+            if prev_vwap is not None and (prev_vwap == prev_vwap) and prev_vwap > 0:
+                self.state["prev_anchor_vwap"] = str(prev_vwap)
+                self.state["prev_anchor_start_ms"] = int(prev_anchor or 0)
+
+            # Reset anchor_open per-anchor markers
+            self.state["anchor_open_first_vwap"] = None
+            self.state["anchor_open_first_vwap_ms"] = 0
+            self.state["anchor_open_decision_anchor_ms"] = 0
+
             # Reset VWAP accumulators for new anchor period
             self.state["last_anchor_start_ms"] = anchor_start_ms
             self.state["cum_pq"] = "0"
@@ -1162,6 +1445,19 @@ class EtherealVWAPStrategy:
             else:
                 self._log_pause_status(now_ms)
                 return
+
+        # Strategy switch
+        if self._cfg_strategy() == "anchor_open":
+            await self._anchor_open_step(
+                now=now,
+                now_ms=now_ms,
+                anchor_start_ms=anchor_start_ms,
+                prev_anchor_ms=prev_anchor,
+                vwap=vwap,
+                pos=pos,
+                has_pos=has_pos,
+            )
+            return
 
         if not has_pos:
             # Detect position close transition (prev>0 -> now==0) and decide pause reason.
@@ -1242,6 +1538,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
         trades_page_limit = min(max(trades_page_limit, 1), 200)
         return (
             StrategyConfig(
+                strategy=str(raw.get("strategy", "vwap")),
                 ticker=str(raw.get("ticker", "SOLUSD")),
                 direction=str(raw.get("direction", "LONG")).upper(),
                 poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -1258,6 +1555,9 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
                 pause_on_sl=bool(raw.get("pause_on_sl", False)),
                 pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
+                anchor_open_min_vwap_delta_pct=_as_decimal(raw.get("anchor_open_min_vwap_delta_pct", "0")),
+                anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
+                anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
                 max_trade_pages=int(raw.get("max_trade_pages", 6)),
                 trades_page_limit=trades_page_limit,
                 vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
@@ -1277,6 +1577,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(
             {
+                "strategy": cfg.strategy,
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "poll_interval_sec": cfg.poll_interval_sec,
@@ -1293,6 +1594,9 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "exit_expires_in_sec": cfg.exit_expires_in_sec,
                 "pause_on_sl": cfg.pause_on_sl,
                 "pause_after_sl_minutes": cfg.pause_after_sl_minutes,
+                "anchor_open_min_vwap_delta_pct": str(cfg.anchor_open_min_vwap_delta_pct),
+                "anchor_open_sl_pct_of_tp": str(cfg.anchor_open_sl_pct_of_tp),
+                "anchor_open_close_on_anchor_end": cfg.anchor_open_close_on_anchor_end,
                 "max_trade_pages": cfg.max_trade_pages,
                 "trades_page_limit": cfg.trades_page_limit,
                 "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
@@ -1324,6 +1628,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
     trades_page_limit = int(raw.get("trades_page_limit", 200))
     trades_page_limit = min(max(trades_page_limit, 1), 200)  # clamp to API max
     return StrategyConfig(
+        strategy=str(raw.get("strategy", "vwap")),
         ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
         direction=str(raw.get("direction", "LONG")).strip().upper(),
         poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -1340,6 +1645,9 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
         pause_on_sl=bool(raw.get("pause_on_sl", False)),
         pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
+        anchor_open_min_vwap_delta_pct=_as_decimal(raw.get("anchor_open_min_vwap_delta_pct", "0")),
+        anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
+        anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
         max_trade_pages=int(raw.get("max_trade_pages", 6)),
         trades_page_limit=trades_page_limit,
         vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
@@ -1356,6 +1664,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
 
 def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
     return {
+        "strategy": str(getattr(cfg, "strategy", "vwap")),
         "ticker": cfg.ticker,
         "direction": cfg.direction,
         "poll_interval_sec": cfg.poll_interval_sec,
@@ -1372,6 +1681,9 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "exit_expires_in_sec": cfg.exit_expires_in_sec,
         "pause_on_sl": cfg.pause_on_sl,
         "pause_after_sl_minutes": int(getattr(cfg, "pause_after_sl_minutes", 0) or 0),
+        "anchor_open_min_vwap_delta_pct": str(getattr(cfg, "anchor_open_min_vwap_delta_pct", Decimal("0"))),
+        "anchor_open_sl_pct_of_tp": str(getattr(cfg, "anchor_open_sl_pct_of_tp", Decimal("100"))),
+        "anchor_open_close_on_anchor_end": bool(getattr(cfg, "anchor_open_close_on_anchor_end", True)),
         "max_trade_pages": cfg.max_trade_pages,
         "trades_page_limit": cfg.trades_page_limit,
         "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
