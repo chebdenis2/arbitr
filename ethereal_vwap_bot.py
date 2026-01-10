@@ -47,6 +47,16 @@ def _quantize_down(x: Decimal, step: Decimal) -> Decimal:
     return q
 
 
+def _is_pos_finite_decimal(x: Decimal) -> bool:
+    """True if x is a finite Decimal > 0 (guards NaN comparisons)."""
+    try:
+        if not (x == x):
+            return False
+        return x > 0
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class StrategyConfig:
     # Strategy selection:
@@ -578,7 +588,7 @@ class EtherealVWAPStrategy:
 
     def _levels(self, vwap: Decimal) -> Tuple[Decimal, Decimal, Decimal]:
         """(entry, tp, sl) based on VWAP and config."""
-        if not (vwap == vwap) or vwap <= 0:
+        if not _is_pos_finite_decimal(vwap):
             return Decimal("NaN"), Decimal("NaN"), Decimal("NaN")
 
         p_entry = self.cfg.entry_distance_long_pct if self.direction == "LONG" else self.cfg.entry_distance_short_pct
@@ -784,7 +794,7 @@ class EtherealVWAPStrategy:
                 self.state["entry_client_order_id"] = None
                 self._save_state()
         qty = self._round_qty(self.cfg.entry_quantity)
-        if qty <= 0 or entry_px <= 0:
+        if not _is_pos_finite_decimal(qty) or not _is_pos_finite_decimal(entry_px):
             return
 
         side = 0 if self.direction == "LONG" else 1
@@ -869,12 +879,16 @@ class EtherealVWAPStrategy:
 
         size = _as_decimal(pos.get("size") or "0").copy_abs()
         qty = self._round_qty(size)
-        if qty <= 0:
+        if not _is_pos_finite_decimal(qty):
             return
 
         d = (direction or self.direction or "LONG").strip().upper()
         if d not in {"LONG", "SHORT"}:
             d = self.direction
+
+        # Don't place exits if TP/SL are invalid.
+        if not _is_pos_finite_decimal(tp_px) or not _is_pos_finite_decimal(sl_px):
+            return
 
         # Close direction
         exit_side = 1 if d == "LONG" else 0
