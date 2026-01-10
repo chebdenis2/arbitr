@@ -87,7 +87,7 @@ Edit it to change:
 - `anchor_period` (Session/Week/Month/Year/Hour/2 Hours/4 Hours/8 Hours/12 Hours)
 - `pause_after_sl_minutes` (0/число минут) — пауза после SL на заданное время (в минутах). 0 = выключено
 - `anchor_open_min_vwap_delta_pct` — минимальная разница в % между VWAP старого и первого VWAP нового анкера, чтобы открыть сделку
-- `anchor_open_min_delta_pct` — минимальная разница в % между **ценой закрытия прошлого анкера** и **ценой открытия нового анкера**, чтобы открыть сделку
+- `anchor_open_min_delta_pct` — минимальная разница в % между **последним VWAP прошлого анкера** и **ценой открытия нового анкера**, чтобы открыть сделку
 - `anchor_open_sl_pct_of_tp` — стоп‑лосс в % от размера тейк‑профита (TP size = |first_vwap_new - last_vwap_old|)
 - `anchor_open_close_on_anchor_end` (true/false) — закрывать позицию по рынку в конце анкера
 - `max_trade_pages` / `trades_page_limit` — сколько публичных трейдов сканировать для VWAP (на сильной волатильности увеличивайте)
