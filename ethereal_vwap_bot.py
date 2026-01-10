@@ -255,6 +255,11 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_vwap", None)  # str Decimal
         self.state.setdefault("last_vwap_ms", 0)
         self.state.setdefault("last_vwap_anchor_ms", 0)
+        # Last VWAP within *current* anchor (monotonic update while anchor is active).
+        # This is the "last VWAP of anchor" persisted for reliable rollover.
+        self.state.setdefault("anchor_last_vwap", None)  # str Decimal
+        self.state.setdefault("anchor_last_vwap_ms", 0)
+        self.state.setdefault("anchor_last_vwap_anchor_ms", 0)
 
         # Anchor-open strategy state
         self.state.setdefault("prev_anchor_vwap", None)  # str Decimal (TP reference)
@@ -1412,7 +1417,7 @@ class EtherealVWAPStrategy:
         prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
         if prev_anchor != anchor_start_ms:
             # Persist last VWAP of previous anchor (TP reference for anchor_open).
-            prev_vwap = self._decimal_from_state("last_vwap")
+            prev_vwap = self._decimal_from_state("anchor_last_vwap") or self._decimal_from_state("last_vwap")
             if prev_vwap is not None:
                 self.state["prev_anchor_vwap"] = str(prev_vwap)
                 self.state["prev_anchor_start_ms"] = int(prev_anchor or 0)
@@ -1422,6 +1427,11 @@ class EtherealVWAPStrategy:
             self.state["anchor_open_open_price_ms"] = 0
             self.state["anchor_open_decision_anchor_ms"] = 0
             self.state["anchor_open_last_wait_log_ms"] = 0
+
+            # Reset per-anchor VWAP tracker for the new anchor.
+            self.state["anchor_last_vwap"] = None
+            self.state["anchor_last_vwap_ms"] = 0
+            self.state["anchor_last_vwap_anchor_ms"] = int(anchor_start_ms)
 
             # Reset VWAP accumulators for new anchor period
             self.state["last_anchor_start_ms"] = anchor_start_ms
@@ -1462,6 +1472,14 @@ class EtherealVWAPStrategy:
             self.state["last_vwap_ms"] = int(now_ms)
             self.state["last_vwap_anchor_ms"] = int(anchor_start_ms)
             if prev_saved_vwap <= 0 or (vwap - prev_saved_vwap).copy_abs() / vwap > Decimal("0.0005"):
+                self._save_state()
+
+            # Also persist "last VWAP of this anchor" (updated only when anchor matches).
+            prev_anchor_vwap = self._decimal_from_state("anchor_last_vwap") or Decimal("0")
+            self.state["anchor_last_vwap"] = str(vwap)
+            self.state["anchor_last_vwap_ms"] = int(now_ms)
+            self.state["anchor_last_vwap_anchor_ms"] = int(anchor_start_ms)
+            if prev_anchor_vwap <= 0 or (vwap - prev_anchor_vwap).copy_abs() / vwap > Decimal("0.0005"):
                 self._save_state()
 
         # Handle SL/TP fills even if position visibility lags.
