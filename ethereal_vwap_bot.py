@@ -84,16 +84,15 @@ class StrategyConfig:
     # ---------------------------
     # Strategy: anchor_open
     # ---------------------------
-    # Open trade only if abs(delta VWAP) >= threshold (%), where:
-    #   delta_pct = abs((first_vwap_new_anchor - last_vwap_prev_anchor) / last_vwap_prev_anchor) * 100
-    anchor_open_min_vwap_delta_pct: Decimal = Decimal("0")
+    # Open trade only if abs(delta) >= threshold (%), where:
+    #   delta_pct = abs((open_price_new_anchor - close_price_prev_anchor) / close_price_prev_anchor) * 100
+    # NOTE: this replaces the previous "first VWAP" approach to avoid NaN at anchor start.
+    anchor_open_min_delta_pct: Decimal = Decimal("0")
     # Stop-loss size as % of TP size, where:
     #   tp_size = abs(first_vwap_new_anchor - last_vwap_prev_anchor)
     anchor_open_sl_pct_of_tp: Decimal = Decimal("100")
     # Close any open position at anchor end (recommended).
     anchor_open_close_on_anchor_end: bool = True
-    # If VWAP for new anchor is not yet available (NaN), use oracle price as a proxy for "first VWAP".
-    anchor_open_use_oracle_if_no_vwap: bool = True
 
     max_trade_pages: int = 6  # VWAP from public trades: pages*limit trades
     trades_page_limit: int = 200  # API constraint: max 200
@@ -236,21 +235,20 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_position_size", "0")
         self.state.setdefault("last_close_reason", None)
         self.state.setdefault("last_close_at", None)
-        # Last computed VWAP snapshot (independent of source) for robust anchor transitions.
-        self.state.setdefault("last_vwap", None)  # str Decimal
-        self.state.setdefault("last_vwap_ms", 0)
-        self.state.setdefault("last_vwap_anchor_ms", 0)
+        # Last known oracle price snapshot (for robust anchor transitions in anchor_open).
+        self.state.setdefault("last_price", None)  # str Decimal
+        self.state.setdefault("last_price_ms", 0)
+        self.state.setdefault("last_price_anchor_ms", 0)
 
         # Anchor-open strategy state
-        self.state.setdefault("prev_anchor_vwap", None)  # str Decimal
+        self.state.setdefault("prev_anchor_close_price", None)  # str Decimal
         self.state.setdefault("prev_anchor_start_ms", 0)
-        self.state.setdefault("anchor_open_first_vwap", None)  # str Decimal
-        self.state.setdefault("anchor_open_first_vwap_ms", 0)
-        self.state.setdefault("anchor_open_first_is_oracle", False)
+        self.state.setdefault("anchor_open_open_price", None)  # str Decimal
+        self.state.setdefault("anchor_open_open_price_ms", 0)
         self.state.setdefault("anchor_open_decision_anchor_ms", 0)  # anchor_start_ms where decision (opened/skipped) was made
         self.state.setdefault("anchor_open_active", False)
         self.state.setdefault("anchor_open_direction", None)  # LONG|SHORT
-        self.state.setdefault("anchor_open_tp_price", None)  # str Decimal (last VWAP prev anchor)
+        self.state.setdefault("anchor_open_tp_price", None)  # str Decimal (close price prev anchor)
         self.state.setdefault("anchor_open_sl_price", None)  # str Decimal
         self.state.setdefault("anchor_open_tp_size", None)  # str Decimal
         self.state.setdefault("anchor_open_delta_pct", None)  # str Decimal
@@ -1082,15 +1080,17 @@ class EtherealVWAPStrategy:
         # Keep prev_anchor_vwap for next anchor.
         self._save_state()
 
-    def _vwap_from_accumulators(self) -> Optional[Decimal]:
+    def _price_from_state(self, key: str) -> Optional[Decimal]:
+        raw = self.state.get(key)
+        if raw is None:
+            return None
         try:
-            q = _as_decimal(self.state.get("cum_q") or "0")
-            if q <= 0:
-                return None
-            pq = _as_decimal(self.state.get("cum_pq") or "0")
-            return pq / q
+            d = _as_decimal(raw)
         except Exception:
             return None
+        if not (d == d) or d <= 0:
+            return None
+        return d
 
     async def _place_market_order(self, *, side: int, qty: Decimal, reduce_only: bool, tag: str) -> Optional[str]:
         if qty <= 0:
@@ -1185,61 +1185,31 @@ class EtherealVWAPStrategy:
         if decision_anchor == int(anchor_start_ms):
             return
 
-        prev_vwap_raw = self.state.get("prev_anchor_vwap")
-        if prev_vwap_raw is None:
-            return
-        try:
-            prev_vwap = _as_decimal(prev_vwap_raw)
-        except Exception:
-            return
-        if not (prev_vwap == prev_vwap) or prev_vwap <= 0:
+        prev_close = self._price_from_state("prev_anchor_close_price")
+        if prev_close is None:
             return
 
-        # Capture first VWAP of this anchor (once VWAP becomes valid).
-        if self.state.get("anchor_open_first_vwap") is None:
-            first = vwap
-            first_is_oracle = False
-            if not (first == first) or first <= 0:
-                # Fallback: some instruments may have no trades at anchor start => VWAP is NaN for a while.
-                if bool(getattr(self.cfg, "anchor_open_use_oracle_if_no_vwap", True)) and (price == price) and price > 0:
-                    first = price
-                    first_is_oracle = True
-                else:
-                    # Throttle waiting logs to ~1/min
-                    last_ms = int(self.state.get("anchor_open_last_wait_log_ms") or 0)
-                    if not last_ms or (now_ms - last_ms) >= 60_000:
-                        self.state["anchor_open_last_wait_log_ms"] = int(now_ms)
-                        self._save_state()
-                        logger.info(
-                            "ANCHOR_OPEN: waiting for first VWAP of new anchor (%s %s) vwap=%s price=%s",
-                            self.cfg.ticker,
-                            self.cfg.anchor_period,
-                            str(vwap),
-                            str(price),
-                        )
-                    return
-
-            self.state["anchor_open_first_vwap"] = str(first)
-            self.state["anchor_open_first_vwap_ms"] = int(now_ms)
-            self.state["anchor_open_first_is_oracle"] = bool(first_is_oracle)
+        # Capture the "open price" of this anchor (first oracle price we see after anchor start).
+        if self.state.get("anchor_open_open_price") is None:
+            if not (price == price) or price <= 0:
+                return
+            self.state["anchor_open_open_price"] = str(price)
+            self.state["anchor_open_open_price_ms"] = int(now_ms)
             self._save_state()
 
-        try:
-            first_vwap = _as_decimal(self.state.get("anchor_open_first_vwap"))
-        except Exception:
-            return
-        if not (first_vwap == first_vwap) or first_vwap <= 0:
+        open_px = self._price_from_state("anchor_open_open_price")
+        if open_px is None:
             return
 
-        delta = (first_vwap - prev_vwap)
+        delta = (open_px - prev_close)
         if delta == 0:
             self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
             self._save_state()
-            logger.info("ANCHOR_OPEN skip: delta=0 (prev_vwap=%s first_vwap=%s)", str(prev_vwap), str(first_vwap))
+            logger.info("ANCHOR_OPEN skip: delta=0 (prev_close=%s open=%s)", str(prev_close), str(open_px))
             return
 
-        delta_pct = (delta.copy_abs() / prev_vwap) * Decimal("100")
-        thr = _as_decimal(getattr(self.cfg, "anchor_open_min_vwap_delta_pct", Decimal("0")) or "0")
+        delta_pct = (delta.copy_abs() / prev_close) * Decimal("100")
+        thr = _as_decimal(getattr(self.cfg, "anchor_open_min_delta_pct", Decimal("0")) or "0")
         if thr < 0:
             thr = Decimal("0")
         if delta_pct < thr:
@@ -1247,21 +1217,21 @@ class EtherealVWAPStrategy:
             self.state["anchor_open_delta_pct"] = str(delta_pct)
             self._save_state()
             logger.info(
-                "ANCHOR_OPEN skip: delta_pct=%s < thr=%s (prev_vwap=%s first_vwap=%s)",
+                "ANCHOR_OPEN skip: delta_pct=%s < thr=%s (prev_close=%s open=%s)",
                 str(delta_pct),
                 str(thr),
-                str(prev_vwap),
-                str(first_vwap),
+                str(prev_close),
+                str(open_px),
             )
             return
 
-        # Direction: if new VWAP > old VWAP => SHORT (to TP down to old VWAP). Else LONG.
-        trade_dir = "SHORT" if first_vwap > prev_vwap else "LONG"
+        # Direction: if open > prev close => SHORT (to TP down to prev close). Else LONG.
+        trade_dir = "SHORT" if open_px > prev_close else "LONG"
         side = 0 if trade_dir == "LONG" else 1
 
-        # TP and SL based on VWAPs (reference).
-        tp_price = prev_vwap
-        tp_size = (first_vwap - prev_vwap).copy_abs()
+        # TP and SL based on prices.
+        tp_price = prev_close
+        tp_size = (open_px - prev_close).copy_abs()
         if tp_size <= 0:
             self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
             self._save_state()
@@ -1271,8 +1241,8 @@ class EtherealVWAPStrategy:
         if sl_pct_of_tp < 0:
             sl_pct_of_tp = Decimal("0")
         sl_size = tp_size * (sl_pct_of_tp / Decimal("100"))
-        # Stop is placed around the entry reference (first_vwap).
-        sl_price = (first_vwap - sl_size) if trade_dir == "LONG" else (first_vwap + sl_size)
+        # Stop is placed around the entry reference (open price).
+        sl_price = (open_px - sl_size) if trade_dir == "LONG" else (open_px + sl_size)
 
         qty = self._round_qty(self.cfg.entry_quantity)
         if qty <= 0:
@@ -1296,14 +1266,13 @@ class EtherealVWAPStrategy:
         self._save_state()
 
         logger.warning(
-            "ANCHOR_OPEN ENTRY: %s %s qty=%s (order_id=%s) prev_vwap=%s first=%s%s delta_pct=%s thr=%s TP=%s SL=%s sl_pct_of_tp=%s tp_size=%s",
+            "ANCHOR_OPEN ENTRY: %s %s qty=%s (order_id=%s) prev_close=%s open=%s delta_pct=%s thr=%s TP=%s SL=%s sl_pct_of_tp=%s tp_size=%s",
             trade_dir,
             self.cfg.ticker,
             qty,
             oid,
-            str(prev_vwap),
-            str(first_vwap),
-            ("(oracle)" if bool(self.state.get("anchor_open_first_is_oracle")) else ""),
+            str(prev_close),
+            str(open_px),
             str(delta_pct),
             str(thr),
             str(self._round_price(tp_price)),
@@ -1410,25 +1379,15 @@ class EtherealVWAPStrategy:
         anchor_start_ms = _dt_to_ms(anchor_start)
         prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
         if prev_anchor != anchor_start_ms:
-            # Persist last VWAP of previous anchor (used by anchor_open strategy).
-            # Prefer last_vwap snapshot (works for both ethereal_trades and bybit_klines); fallback to accumulators.
-            prev_vwap_raw = self.state.get("last_vwap")
-            prev_vwap = None
-            try:
-                if prev_vwap_raw is not None:
-                    prev_vwap = _as_decimal(prev_vwap_raw)
-            except Exception:
-                prev_vwap = None
-            if prev_vwap is None or not (prev_vwap == prev_vwap) or prev_vwap <= 0:
-                prev_vwap = self._vwap_from_accumulators()
-            if prev_vwap is not None and (prev_vwap == prev_vwap) and prev_vwap > 0:
-                self.state["prev_anchor_vwap"] = str(prev_vwap)
+            # Persist last price of previous anchor (used by anchor_open strategy).
+            prev_close = self._price_from_state("last_price")
+            if prev_close is not None:
+                self.state["prev_anchor_close_price"] = str(prev_close)
                 self.state["prev_anchor_start_ms"] = int(prev_anchor or 0)
 
             # Reset anchor_open per-anchor markers
-            self.state["anchor_open_first_vwap"] = None
-            self.state["anchor_open_first_vwap_ms"] = 0
-            self.state["anchor_open_first_is_oracle"] = False
+            self.state["anchor_open_open_price"] = None
+            self.state["anchor_open_open_price_ms"] = 0
             self.state["anchor_open_decision_anchor_ms"] = 0
             self.state["anchor_open_last_wait_log_ms"] = 0
 
@@ -1455,20 +1414,13 @@ class EtherealVWAPStrategy:
         vwap = await self._get_vwap(anchor_start_ms, now_ms)
         entry_px, tp_px, sl_px = self._levels(vwap)
 
-        # Persist last known VWAP snapshot for robust anchor transitions (and for diagnostics).
-        if (vwap == vwap) and vwap > 0:
-            prev_saved_raw = self.state.get("last_vwap")
-            try:
-                prev_saved = _as_decimal(prev_saved_raw) if prev_saved_raw is not None else Decimal("0")
-            except Exception:
-                prev_saved = Decimal("0")
-
-            self.state["last_vwap"] = str(vwap)
-            self.state["last_vwap_ms"] = int(now_ms)
-            self.state["last_vwap_anchor_ms"] = int(anchor_start_ms)
-
-            # avoid excessive writes: only save when value materially changes
-            if prev_saved <= 0 or (vwap - prev_saved).copy_abs() / vwap > Decimal("0.0005"):
+        # Persist last known oracle price snapshot for robust anchor transitions.
+        if (price == price) and price > 0:
+            prev_saved = self._price_from_state("last_price") or Decimal("0")
+            self.state["last_price"] = str(price)
+            self.state["last_price_ms"] = int(now_ms)
+            self.state["last_price_anchor_ms"] = int(anchor_start_ms)
+            if prev_saved <= 0 or (price - prev_saved).copy_abs() / price > Decimal("0.0005"):
                 self._save_state()
 
         # Handle SL/TP fills even if position visibility lags.
@@ -1613,10 +1565,9 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
                 pause_on_sl=bool(raw.get("pause_on_sl", False)),
                 pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
-                anchor_open_min_vwap_delta_pct=_as_decimal(raw.get("anchor_open_min_vwap_delta_pct", "0")),
+                anchor_open_min_delta_pct=_as_decimal(raw.get("anchor_open_min_delta_pct", raw.get("anchor_open_min_vwap_delta_pct", "0"))),
                 anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
                 anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
-                anchor_open_use_oracle_if_no_vwap=bool(raw.get("anchor_open_use_oracle_if_no_vwap", True)),
                 max_trade_pages=int(raw.get("max_trade_pages", 6)),
                 trades_page_limit=trades_page_limit,
                 vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
@@ -1653,10 +1604,9 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "exit_expires_in_sec": cfg.exit_expires_in_sec,
                 "pause_on_sl": cfg.pause_on_sl,
                 "pause_after_sl_minutes": cfg.pause_after_sl_minutes,
-                "anchor_open_min_vwap_delta_pct": str(cfg.anchor_open_min_vwap_delta_pct),
+                "anchor_open_min_delta_pct": str(cfg.anchor_open_min_delta_pct),
                 "anchor_open_sl_pct_of_tp": str(cfg.anchor_open_sl_pct_of_tp),
                 "anchor_open_close_on_anchor_end": cfg.anchor_open_close_on_anchor_end,
-                "anchor_open_use_oracle_if_no_vwap": cfg.anchor_open_use_oracle_if_no_vwap,
                 "max_trade_pages": cfg.max_trade_pages,
                 "trades_page_limit": cfg.trades_page_limit,
                 "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
@@ -1705,10 +1655,9 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
         pause_on_sl=bool(raw.get("pause_on_sl", False)),
         pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
-        anchor_open_min_vwap_delta_pct=_as_decimal(raw.get("anchor_open_min_vwap_delta_pct", "0")),
+        anchor_open_min_delta_pct=_as_decimal(raw.get("anchor_open_min_delta_pct", raw.get("anchor_open_min_vwap_delta_pct", "0"))),
         anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
         anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
-        anchor_open_use_oracle_if_no_vwap=bool(raw.get("anchor_open_use_oracle_if_no_vwap", True)),
         max_trade_pages=int(raw.get("max_trade_pages", 6)),
         trades_page_limit=trades_page_limit,
         vwap_recalc_threshold=_as_decimal(raw.get("vwap_recalc_threshold", "0.0005")),
@@ -1742,10 +1691,9 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "exit_expires_in_sec": cfg.exit_expires_in_sec,
         "pause_on_sl": cfg.pause_on_sl,
         "pause_after_sl_minutes": int(getattr(cfg, "pause_after_sl_minutes", 0) or 0),
-        "anchor_open_min_vwap_delta_pct": str(getattr(cfg, "anchor_open_min_vwap_delta_pct", Decimal("0"))),
+        "anchor_open_min_delta_pct": str(getattr(cfg, "anchor_open_min_delta_pct", Decimal("0"))),
         "anchor_open_sl_pct_of_tp": str(getattr(cfg, "anchor_open_sl_pct_of_tp", Decimal("100"))),
         "anchor_open_close_on_anchor_end": bool(getattr(cfg, "anchor_open_close_on_anchor_end", True)),
-        "anchor_open_use_oracle_if_no_vwap": bool(getattr(cfg, "anchor_open_use_oracle_if_no_vwap", True)),
         "max_trade_pages": cfg.max_trade_pages,
         "trades_page_limit": cfg.trades_page_limit,
         "vwap_recalc_threshold": str(cfg.vwap_recalc_threshold),
