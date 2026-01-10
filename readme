@@ -80,6 +80,7 @@ python3 ethereal_vwap_bot.py
 
 Edit it to change:
 - `strategy` — `"vwap"` (по умолчанию) или `"anchor_open"` (вход на новом анкере маркетом)
+- `deposit_usd` — депозит (USD) для расчёта статистики PNL в % (по каждой стратегии/паре отдельно)
 - `entry_distance_long_pct` / `entry_distance_short_pct`
 - `entry_quantity`
 - `entry_expires_in_sec` / `exit_expires_in_sec`
