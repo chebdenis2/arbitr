@@ -1339,15 +1339,36 @@ class EtherealVWAPStrategy:
 
         prev_vwap = self._decimal_from_state("prev_anchor_vwap")
         if prev_vwap is None:
+            # Most common reason: bot started mid-hour and hasn't completed a full anchor yet,
+            # so there is no "last VWAP of previous anchor" to target.
+            last_ms = int(self.state.get("anchor_open_last_wait_log_ms") or 0)
+            if not last_ms or (now_ms - last_ms) >= 60_000:
+                self.state["anchor_open_last_wait_log_ms"] = int(now_ms)
+                self._save_state()
+                logger.info(
+                    "ANCHOR_OPEN: no prev_anchor_vwap yet for %s (need at least 1 completed anchor with valid VWAP).",
+                    self.cfg.ticker,
+                )
             return
 
         # Capture the "open price" of this anchor (first oracle price we see after anchor start).
         if self.state.get("anchor_open_open_price") is None:
             if not (price == price) or price <= 0:
+                last_ms = int(self.state.get("anchor_open_last_wait_log_ms") or 0)
+                if not last_ms or (now_ms - last_ms) >= 60_000:
+                    self.state["anchor_open_last_wait_log_ms"] = int(now_ms)
+                    self._save_state()
+                    logger.info("ANCHOR_OPEN: waiting for oracle price at new anchor (%s). price=%s", self.cfg.ticker, str(price))
                 return
             self.state["anchor_open_open_price"] = str(price)
             self.state["anchor_open_open_price_ms"] = int(now_ms)
             self._save_state()
+            logger.info(
+                "ANCHOR_OPEN: captured open price for %s open=%s prev_anchor_vwap=%s",
+                self.cfg.ticker,
+                str(price),
+                str(prev_vwap),
+            )
 
         open_px = self._price_from_state("anchor_open_open_price")
         if open_px is None:
