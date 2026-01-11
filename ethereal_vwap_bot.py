@@ -607,7 +607,29 @@ class EtherealVWAPStrategy:
         if not prices:
             return Decimal("NaN")
         p = prices[0]
-        return _as_decimal(getattr(p, "oraclePrice", "0") or "0")
+        # Not all instruments have oraclePrice populated. Fallback to other common fields.
+        # We still return a "reference price" used for anchor_open open-price capture.
+        for k in (
+            "oraclePrice",
+            "oracle_price",
+            "markPrice",
+            "mark_price",
+            "indexPrice",
+            "index_price",
+            "midPrice",
+            "mid_price",
+            "lastPrice",
+            "last_price",
+            "price",
+        ):
+            try:
+                v = _as_decimal(getattr(p, k, None) or "0")
+            except Exception:
+                continue
+            if _is_pos_finite_decimal(v):
+                return v
+        # Keep NaN here (caller decides what to do).
+        return Decimal("NaN")
 
     def _round_price(self, px: Decimal) -> Decimal:
         return _quantize_down(px, self.product_tick_size)
@@ -1353,7 +1375,7 @@ class EtherealVWAPStrategy:
 
         # Capture the "open price" of this anchor (first oracle price we see after anchor start).
         if self.state.get("anchor_open_open_price") is None:
-            if not (price == price) or price <= 0:
+            if not _is_pos_finite_decimal(price):
                 last_ms = int(self.state.get("anchor_open_last_wait_log_ms") or 0)
                 if not last_ms or (now_ms - last_ms) >= 60_000:
                     self.state["anchor_open_last_wait_log_ms"] = int(now_ms)
