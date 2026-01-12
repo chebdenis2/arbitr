@@ -1546,6 +1546,25 @@ class EtherealVWAPStrategy:
         # SHORT
         return desired_sl if desired_sl < current_sl else current_sl
 
+    def _cached_exit_levels(self) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        """Return cached (tp, sl) from state.exit_levels if both are valid."""
+        levels = self.state.get("exit_levels") or {}
+        tp_raw = levels.get("tp")
+        sl_raw = levels.get("sl")
+        try:
+            tp = _as_decimal(tp_raw) if tp_raw is not None else None
+        except Exception:
+            tp = None
+        try:
+            sl = _as_decimal(sl_raw) if sl_raw is not None else None
+        except Exception:
+            sl = None
+        if tp is not None and not _is_pos_finite_decimal(tp):
+            tp = None
+        if sl is not None and not _is_pos_finite_decimal(sl):
+            sl = None
+        return tp, sl
+
     def _set_pause_after_sl(
         self,
         minutes: int,
@@ -1829,7 +1848,17 @@ class EtherealVWAPStrategy:
                 if self.state.get("exit_order_ids"):
                     logger.info("EXITS unchanged: levels unavailable (tp=%s sl=%s). Keeping existing TP/SL.", str(tp_px), str(sl_px))
                 else:
-                    logger.warning("EXITS missing and levels unavailable (tp=%s sl=%s). Position may be unprotected.", str(tp_px), str(sl_px))
+                    # If exits are missing but we have cached levels, place from cache for safety.
+                    c_tp, c_sl = self._cached_exit_levels()
+                    if c_tp is not None and c_sl is not None:
+                        logger.warning(
+                            "EXITS missing and levels unavailable; restoring from cache TP=%s SL=%s",
+                            str(c_tp),
+                            str(c_sl),
+                        )
+                        await self._ensure_oco_exits(pos, c_tp, c_sl)
+                    else:
+                        logger.warning("EXITS missing and levels unavailable (tp=%s sl=%s). Position may be unprotected.", str(tp_px), str(sl_px))
                 return
 
             # If exit levels cache is missing but we have exit orders, hydrate it from API to avoid widening SL.
@@ -1878,7 +1907,17 @@ class EtherealVWAPStrategy:
             else:
                 await self._ensure_oco_exits(pos, tp_px, new_sl)
         else:
-            await self._ensure_oco_exits(pos, tp_px, sl_px)
+            # Outside new-candle refresh, still ensure we have exits.
+            if not self.state.get("exit_order_ids"):
+                if _is_pos_finite_decimal(tp_px) and _is_pos_finite_decimal(sl_px):
+                    await self._ensure_oco_exits(pos, tp_px, sl_px)
+                else:
+                    c_tp, c_sl = self._cached_exit_levels()
+                    if c_tp is not None and c_sl is not None:
+                        logger.warning("EXITS missing; restoring from cache TP=%s SL=%s", str(c_tp), str(c_sl))
+                        await self._ensure_oco_exits(pos, c_tp, c_sl)
+            else:
+                await self._ensure_oco_exits(pos, tp_px, sl_px)
 
     async def run(self) -> None:
         logger.info("Starting VWAP strategy: %s %s", self.direction, self.cfg.ticker)
