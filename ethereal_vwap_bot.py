@@ -233,6 +233,8 @@ class EtherealVWAPStrategy:
         self.state.setdefault("entry_client_order_id", None)
         self.state.setdefault("exit_order_ids", [])
         self.state.setdefault("exit_orders", {"tp": None, "sl": None})
+        # Best-effort cached exit trigger levels (for trailing SL logic without extra API calls).
+        self.state.setdefault("exit_levels", {"tp": None, "sl": None})  # strings (Decimals)
         self.state.setdefault("exit_group_id", None)
         self.state.setdefault("trading_paused", False)
         self.state.setdefault("pause_reason", None)
@@ -724,6 +726,7 @@ class EtherealVWAPStrategy:
             await self._cancel_order_ids(ids)
         self.state["exit_order_ids"] = []
         self.state["exit_orders"] = {"tp": None, "sl": None}
+        self.state["exit_levels"] = {"tp": None, "sl": None}
         self.state["exit_group_id"] = None
 
     async def _confirm_order_status(self, order_id: str) -> Optional[str]:
@@ -1000,6 +1003,7 @@ class EtherealVWAPStrategy:
             sl_id = str(getattr(sl, "id"))
             self.state["exit_order_ids"] = [tp_id, sl_id]
             self.state["exit_orders"] = {"tp": tp_id, "sl": sl_id}
+            self.state["exit_levels"] = {"tp": str(tp_px), "sl": str(sl_px)}
             self.state["exit_group_id"] = group_id
             self._save_state()
             logger.info("EXITS placed (OCO): TP=%s SL=%s qty=%s group=%s", tp_px, sl_px, qty, group_id)
@@ -1494,6 +1498,21 @@ class EtherealVWAPStrategy:
             return 60
         return 0
 
+    def _tightened_sl(self, *, current_sl: Optional[Decimal], desired_sl: Decimal) -> Decimal:
+        """
+        VWAP strategy rule: after entry, SL can only tighten (reduce risk).
+        - LONG: SL price can only move up (increase numerically).
+        - SHORT: SL price can only move down (decrease numerically).
+        """
+        if current_sl is None or not _is_pos_finite_decimal(current_sl):
+            return desired_sl
+        if not _is_pos_finite_decimal(desired_sl):
+            return current_sl
+        if self.direction == "LONG":
+            return desired_sl if desired_sl > current_sl else current_sl
+        # SHORT
+        return desired_sl if desired_sl < current_sl else current_sl
+
     def _set_pause_after_sl(
         self,
         minutes: int,
@@ -1764,10 +1783,35 @@ class EtherealVWAPStrategy:
             await self._cancel_entry()
             self._save_state()
 
-        # Ensure exits exist (OCO TP+SL). On each new candle we refresh exits to follow VWAP.
+        # Ensure exits exist (OCO TP+SL).
+        # On each new candle we refresh:
+        # - TP always follows the newly computed level
+        # - SL only tightens (reduces risk); widening is ignored.
         if is_new_candle:
-            await self._cancel_exits()
-        await self._ensure_oco_exits(pos, tp_px, sl_px)
+            cur_sl: Optional[Decimal] = None
+            try:
+                cur_sl_raw = ((self.state.get("exit_levels") or {}).get("sl"))
+                cur_sl = _as_decimal(cur_sl_raw) if cur_sl_raw is not None else None
+            except Exception:
+                cur_sl = None
+
+            new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=sl_px)
+
+            # If we have exits, refresh them with the tightened SL logic.
+            if self.state.get("exit_order_ids"):
+                # Log when we refuse to widen SL
+                if cur_sl is not None and _is_pos_finite_decimal(cur_sl) and _is_pos_finite_decimal(sl_px):
+                    if self.direction == "LONG" and sl_px < cur_sl:
+                        logger.info("SL not widened (LONG): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
+                    if self.direction == "SHORT" and sl_px > cur_sl:
+                        logger.info("SL not widened (SHORT): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
+
+                await self._cancel_exits()
+                await self._ensure_oco_exits(pos, tp_px, new_sl)
+            else:
+                await self._ensure_oco_exits(pos, tp_px, new_sl)
+        else:
+            await self._ensure_oco_exits(pos, tp_px, sl_px)
 
     async def run(self) -> None:
         logger.info("Starting VWAP strategy: %s %s", self.direction, self.cfg.ticker)
