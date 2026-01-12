@@ -737,6 +737,39 @@ class EtherealVWAPStrategy:
         except Exception:
             return None
 
+    async def _hydrate_exit_levels_from_api(self) -> None:
+        """
+        Best-effort: if we have exit order ids but lost cached exit_levels, fetch stop prices
+        from the API so we can apply "SL only tightens" logic safely.
+        """
+        levels = dict(self.state.get("exit_levels") or {"tp": None, "sl": None})
+        if levels.get("tp") and levels.get("sl"):
+            return
+        eo = self.state.get("exit_orders") or {}
+        ids = {"tp": eo.get("tp"), "sl": eo.get("sl")}
+        changed = False
+        for kind, oid in ids.items():
+            if not oid or levels.get(kind):
+                continue
+            try:
+                o = await self.client.get_order(id=UUID(str(oid)))
+                sp = (
+                    getattr(o, "stop_price", None)
+                    or getattr(o, "stopPrice", None)
+                    or getattr(o, "stop_price", None)
+                )
+                if sp is None:
+                    continue
+                px = _as_decimal(sp)
+                if _is_pos_finite_decimal(px):
+                    levels[kind] = str(px)
+                    changed = True
+            except Exception:
+                continue
+        if changed:
+            self.state["exit_levels"] = levels
+            self._save_state()
+
     @staticmethod
     def _is_working_status(status: Optional[str]) -> bool:
         if not status:
@@ -1592,7 +1625,8 @@ class EtherealVWAPStrategy:
         anchor_start = self._anchor_start(now)
         anchor_start_ms = _dt_to_ms(anchor_start)
         prev_anchor = int(self.state.get("last_anchor_start_ms") or 0)
-        if prev_anchor != anchor_start_ms:
+        anchor_changed = prev_anchor != anchor_start_ms
+        if anchor_changed:
             # Persist last VWAP of previous anchor (TP reference for anchor_open).
             prev_vwap = self._decimal_from_state("anchor_last_vwap") or self._decimal_from_state("last_vwap")
             if prev_vwap is not None:
@@ -1617,7 +1651,9 @@ class EtherealVWAPStrategy:
             self.state["last_trade_ts"] = anchor_start_ms
             self._save_state()
             await self._cancel_entry()
-            await self._cancel_exits()
+            # Important safety rule:
+            # do NOT cancel TP/SL on anchor change — VWAP can be NaN for a while at new anchor start.
+            # We'll refresh exits later when we have valid levels.
             logger.info("New anchor period: %s", anchor_start.isoformat())
 
         # Candle boundary (timeframe) for "full refresh" logic (like original).
@@ -1788,6 +1824,18 @@ class EtherealVWAPStrategy:
         # - TP always follows the newly computed level
         # - SL only tightens (reduces risk); widening is ignored.
         if is_new_candle:
+            # If we don't have valid VWAP-derived levels, keep existing exits untouched.
+            if not _is_pos_finite_decimal(tp_px) or not _is_pos_finite_decimal(sl_px):
+                if self.state.get("exit_order_ids"):
+                    logger.info("EXITS unchanged: levels unavailable (tp=%s sl=%s). Keeping existing TP/SL.", str(tp_px), str(sl_px))
+                else:
+                    logger.warning("EXITS missing and levels unavailable (tp=%s sl=%s). Position may be unprotected.", str(tp_px), str(sl_px))
+                return
+
+            # If exit levels cache is missing but we have exit orders, hydrate it from API to avoid widening SL.
+            if self.state.get("exit_order_ids") and (not (self.state.get("exit_levels") or {}).get("sl")):
+                await self._hydrate_exit_levels_from_api()
+
             cur_sl: Optional[Decimal] = None
             try:
                 cur_sl_raw = ((self.state.get("exit_levels") or {}).get("sl"))
@@ -1795,10 +1843,29 @@ class EtherealVWAPStrategy:
             except Exception:
                 cur_sl = None
 
+            # If we still don't know the current SL but exits exist, do not refresh (could widen accidentally).
+            if self.state.get("exit_order_ids") and not _is_pos_finite_decimal(cur_sl or Decimal("NaN")):
+                logger.info("EXITS unchanged: current SL unknown (missing cache). Keeping existing TP/SL.")
+                return
+
             new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=sl_px)
 
             # If we have exits, refresh them with the tightened SL logic.
             if self.state.get("exit_order_ids"):
+                # If nothing changes after rounding, keep exits (avoid cancel/recreate gaps).
+                try:
+                    cur_tp_raw = ((self.state.get("exit_levels") or {}).get("tp"))
+                    cur_tp = _as_decimal(cur_tp_raw) if cur_tp_raw is not None else None
+                except Exception:
+                    cur_tp = None
+                if _is_pos_finite_decimal(cur_tp or Decimal("NaN")) and _is_pos_finite_decimal(cur_sl or Decimal("NaN")):
+                    r_tp_new = self._round_price(tp_px)
+                    r_sl_new = self._round_price(new_sl)
+                    r_tp_cur = self._round_price(cur_tp)  # type: ignore[arg-type]
+                    r_sl_cur = self._round_price(cur_sl)  # type: ignore[arg-type]
+                    if r_tp_new == r_tp_cur and r_sl_new == r_sl_cur:
+                        return
+
                 # Log when we refuse to widen SL
                 if cur_sl is not None and _is_pos_finite_decimal(cur_sl) and _is_pos_finite_decimal(sl_px):
                     if self.direction == "LONG" and sl_px < cur_sl:
