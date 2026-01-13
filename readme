@@ -82,6 +82,7 @@ Edit it to change:
 - `strategy` — `"vwap"` (по умолчанию) или `"anchor_open"` (вход на новом анкере маркетом)
 - `deposit_usd` — депозит (USD) для расчёта статистики PNL в % (по каждой стратегии/паре отдельно)
 - `trailing_stop_enabled` (true/false) — трейлинг‑стоп по телу предыдущей свечи (для обеих стратегий)
+- `trailing_debug_logs` (true/false) — подробные логи по свечам/трейлингу (какие open/close видит бот и почему двигает/не двигает SL)
 - `entry_distance_long_pct` / `entry_distance_short_pct`
 - `entry_quantity`
 - `entry_expires_in_sec` / `exit_expires_in_sec`

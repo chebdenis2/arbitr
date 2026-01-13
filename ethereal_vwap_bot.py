@@ -72,6 +72,8 @@ class StrategyConfig:
     # - If trade is LONG and prev candle is bearish (close < open) => tighten SL by (open-close)
     # - If trade is SHORT and prev candle is bullish (close > open) => tighten SL by (close-open)
     trailing_stop_enabled: bool = False
+    # Extra verbose logs for trailing stop and candle tracking.
+    trailing_debug_logs: bool = False
 
     ticker: str = "SOLUSD"
     direction: str = "LONG"  # LONG|SHORT
@@ -1432,8 +1434,27 @@ class EtherealVWAPStrategy:
                         return
 
                     # Compute trailing candidate; it is only produced for "opposite" candles by definition.
-                    trail = self._trailing_sl_candidate(trade_direction=d, current_sl=cur_sl)
-                    if trail is None:
+                    trail_info = self._trailing_decision(trade_direction=d, current_sl=cur_sl)
+                    self._trailing_debug(
+                        "TRAIL DEBUG: anchor_open trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_open=%s prev_close=%s body=%s current_sl=%s candidate_raw=%s",
+                        self.cfg.ticker,
+                        d,
+                        str(trail_info.get("eligible")),
+                        str(trail_info.get("reason")),
+                        str(trail_info.get("prev_open")),
+                        str(trail_info.get("prev_close")),
+                        str(trail_info.get("body")),
+                        str(cur_sl),
+                        str(trail_info.get("candidate_raw")),
+                    )
+                    trail = None
+                    if bool(trail_info.get("eligible")):
+                        try:
+                            trail_raw = trail_info.get("candidate_raw")
+                            trail = _as_decimal(trail_raw) if trail_raw is not None else None
+                        except Exception:
+                            trail = None
+                    if trail is None or not _is_pos_finite_decimal(trail):
                         logger.info(
                             "ANCHOR_OPEN trailing no-op: prev_open=%s prev_close=%s direction=%s (ticker=%s)",
                             str(po),
@@ -1663,6 +1684,69 @@ class EtherealVWAPStrategy:
             return current_sl - body
         return None
 
+    def _trailing_debug(self, msg: str, *args: object) -> None:
+        if bool(getattr(self.cfg, "trailing_debug_logs", False)):
+            logger.info(msg, *args)
+
+    def _trailing_decision(self, *, trade_direction: str, current_sl: Optional[Decimal]) -> dict:
+        """
+        Returns a dict with detailed trailing decision info for debugging.
+        """
+        out: dict[str, object] = {"direction": trade_direction, "eligible": False, "reason": None}
+        if current_sl is None or not _is_pos_finite_decimal(current_sl):
+            out["reason"] = "current_sl_invalid"
+            return out
+        if not bool(getattr(self.cfg, "trailing_stop_enabled", False)):
+            out["reason"] = "disabled"
+            return out
+
+        d = (trade_direction or "").strip().upper()
+        if d not in {"LONG", "SHORT"}:
+            out["reason"] = "direction_invalid"
+            return out
+
+        try:
+            o = _as_decimal(self.state.get("prev_candle_open_price"))
+            c = _as_decimal(self.state.get("prev_candle_close_price"))
+        except Exception:
+            out["reason"] = "prev_candle_missing"
+            return out
+
+        out["prev_open"] = o
+        out["prev_close"] = c
+        if not _is_pos_finite_decimal(o) or not _is_pos_finite_decimal(c):
+            out["reason"] = "prev_candle_invalid"
+            return out
+        if o == c:
+            out["reason"] = "doji"
+            return out
+
+        # Determine candle sign
+        out["candle_sign"] = "bull" if c > o else "bear"
+
+        # LONG: act only on bearish candle
+        if d == "LONG":
+            if c >= o:
+                out["reason"] = "not_bearish_for_long"
+                return out
+            body = o - c
+            out["body"] = body
+            cand = current_sl + body
+            out["candidate_raw"] = cand
+            out["eligible"] = True
+            return out
+
+        # SHORT: act only on bullish candle
+        if c <= o:
+            out["reason"] = "not_bullish_for_short"
+            return out
+        body = c - o
+        out["body"] = body
+        cand = current_sl - body
+        out["candidate_raw"] = cand
+        out["eligible"] = True
+        return out
+
     def _cached_exit_levels(self) -> tuple[Optional[Decimal], Optional[Decimal]]:
         """Return cached (tp, sl) from state.exit_levels if both are valid."""
         levels = self.state.get("exit_levels") or {}
@@ -1809,6 +1893,13 @@ class EtherealVWAPStrategy:
             self.state["last_candle_start_ms"] = candle_start_ms
             self._save_state()
             logger.info("NEW CANDLE %s — full refresh", _ms_to_dt(candle_start_ms).isoformat())
+            self._trailing_debug(
+                "TRAIL DEBUG: new_candle_start=%s prev_candle_start=%s prev_open=%s prev_close=%s",
+                _ms_to_dt(candle_start_ms).isoformat(),
+                (_ms_to_dt(int(self.state.get("prev_candle_start_ms") or 0)).isoformat() if int(self.state.get("prev_candle_start_ms") or 0) else "0"),
+                str(self.state.get("prev_candle_open_price")),
+                str(self.state.get("prev_candle_close_price")),
+            )
 
         price = await self.get_oracle_price()
         vwap = await self._get_vwap(anchor_start_ms, now_ms)
@@ -1831,6 +1922,14 @@ class EtherealVWAPStrategy:
             if self.state.get("candle_open_price") is None:
                 self.state["candle_open_price"] = str(price)
             self.state["candle_close_price"] = str(price)
+            self._trailing_debug(
+                "TRAIL DEBUG: candle_update ticker=%s candle_start=%s open=%s close=%s price=%s",
+                self.cfg.ticker,
+                _ms_to_dt(int(self.state.get("candle_start_ms") or 0)).isoformat(),
+                str(self.state.get("candle_open_price")),
+                str(self.state.get("candle_close_price")),
+                str(price),
+            )
 
         # Persist last known VWAP snapshot for anchor_open TP (works for any vwap_source).
         if (vwap == vwap) and vwap > 0:
@@ -2016,7 +2115,26 @@ class EtherealVWAPStrategy:
             # Start with VWAP-derived SL tightening.
             new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=sl_px)
             # Apply trailing stop rule (relative to current SL, using prev candle body).
-            trail = self._trailing_sl_candidate(trade_direction=self.direction, current_sl=cur_sl)
+            trail_info = self._trailing_decision(trade_direction=self.direction, current_sl=cur_sl)
+            trail = None
+            if bool(trail_info.get("eligible")):
+                try:
+                    trail_raw = trail_info.get("candidate_raw")
+                    trail = _as_decimal(trail_raw) if trail_raw is not None else None
+                except Exception:
+                    trail = None
+            self._trailing_debug(
+                "TRAIL DEBUG: vwap trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_open=%s prev_close=%s body=%s current_sl=%s candidate_raw=%s",
+                self.cfg.ticker,
+                self.direction,
+                str(trail_info.get("eligible")),
+                str(trail_info.get("reason")),
+                str(trail_info.get("prev_open")),
+                str(trail_info.get("prev_close")),
+                str(trail_info.get("body")),
+                str(cur_sl),
+                str(trail_info.get("candidate_raw")),
+            )
             if trail is not None and _is_pos_finite_decimal(trail):
                 # Round trailing candidate to tick size before comparing/applying.
                 trail_r = self._round_price(trail)
@@ -2044,21 +2162,15 @@ class EtherealVWAPStrategy:
                         logger.info("SL not widened (LONG): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
                     if self.direction == "SHORT" and sl_px > cur_sl:
                         logger.info("SL not widened (SHORT): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
-                if cur_sl is not None and _is_pos_finite_decimal(cur_sl):
-                    try:
-                        po = _as_decimal(self.state.get("prev_candle_open_price"))
-                        pc = _as_decimal(self.state.get("prev_candle_close_price"))
-                    except Exception:
-                        po, pc = Decimal("NaN"), Decimal("NaN")
-                    if trail is not None and _is_pos_finite_decimal(trail):
-                        logger.info(
-                            "Trailing SL candidate: prev_open=%s prev_close=%s current_sl=%s trail=%s -> chosen=%s",
-                            str(po),
-                            str(pc),
-                            str(cur_sl),
-                            str(self._round_price(trail)),
-                            str(self._round_price(new_sl)),
-                        )
+                if cur_sl is not None and _is_pos_finite_decimal(cur_sl) and trail is not None and _is_pos_finite_decimal(trail):
+                    logger.info(
+                        "Trailing SL candidate: prev_open=%s prev_close=%s current_sl=%s trail=%s -> chosen=%s",
+                        str(trail_info.get("prev_open")),
+                        str(trail_info.get("prev_close")),
+                        str(cur_sl),
+                        str(self._round_price(trail)),
+                        str(self._round_price(new_sl)),
+                    )
 
                 await self._cancel_exits()
                 await self._ensure_oco_exits(pos, tp_px, new_sl)
