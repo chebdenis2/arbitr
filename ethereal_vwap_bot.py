@@ -1414,6 +1414,11 @@ class EtherealVWAPStrategy:
                     d = str(self.state.get("anchor_open_direction") or "").upper() or "LONG"
                     if d not in {"LONG", "SHORT"}:
                         d = "LONG"
+                    try:
+                        po = _as_decimal(self.state.get("prev_candle_open_price"))
+                        pc = _as_decimal(self.state.get("prev_candle_close_price"))
+                    except Exception:
+                        po, pc = Decimal("NaN"), Decimal("NaN")
                     # Ensure we know current SL.
                     if not (self.state.get("exit_levels") or {}).get("sl"):
                         await self._hydrate_exit_levels_from_api()
@@ -1422,30 +1427,53 @@ class EtherealVWAPStrategy:
                         cur_sl = _as_decimal(cur_sl_raw) if cur_sl_raw is not None else None
                     except Exception:
                         cur_sl = None
-                    if cur_sl is not None and _is_pos_finite_decimal(cur_sl):
-                        trail = self._trailing_sl_candidate(trade_direction=d, current_sl=cur_sl)
-                        if trail is not None and _is_pos_finite_decimal(trail):
-                            new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=trail)
-                            # Use cached TP (prefer exit_levels, fallback anchor_open_tp_price).
-                            tp = self._decimal_from_state("anchor_open_tp_price") or self._decimal_from_state("prev_anchor_vwap")
-                            try:
-                                cur_tp_raw = ((self.state.get("exit_levels") or {}).get("tp"))
-                                cur_tp = _as_decimal(cur_tp_raw) if cur_tp_raw is not None else None
-                            except Exception:
-                                cur_tp = None
-                            tp_use = cur_tp if (cur_tp is not None and _is_pos_finite_decimal(cur_tp)) else tp
-                            if tp_use is not None and _is_pos_finite_decimal(tp_use):
-                                if self._round_price(new_sl) != self._round_price(cur_sl):
-                                    logger.info(
-                                        "ANCHOR_OPEN trailing SL: %s %s current_sl=%s trail=%s -> new_sl=%s",
-                                        d,
-                                        self.cfg.ticker,
-                                        str(cur_sl),
-                                        str(trail),
-                                        str(new_sl),
-                                    )
-                                    await self._cancel_exits()
-                                    await self._ensure_oco_exits(pos, self._round_price(tp_use), self._round_price(new_sl), direction=d)
+                    if cur_sl is None or not _is_pos_finite_decimal(cur_sl):
+                        logger.info("ANCHOR_OPEN trailing skipped: current SL unknown (ticker=%s)", self.cfg.ticker)
+                        return
+
+                    # Compute trailing candidate; it is only produced for "opposite" candles by definition.
+                    trail = self._trailing_sl_candidate(trade_direction=d, current_sl=cur_sl)
+                    if trail is None:
+                        logger.info(
+                            "ANCHOR_OPEN trailing no-op: prev_open=%s prev_close=%s direction=%s (ticker=%s)",
+                            str(po),
+                            str(pc),
+                            d,
+                            self.cfg.ticker,
+                        )
+                        return
+
+                    # Round trailing candidate to tick size before applying.
+                    trail_r = self._round_price(trail)
+                    new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=trail_r)
+
+                    # Use cached TP (prefer exit_levels, fallback anchor_open_tp_price).
+                    tp = self._decimal_from_state("anchor_open_tp_price") or self._decimal_from_state("prev_anchor_vwap")
+                    try:
+                        cur_tp_raw = ((self.state.get("exit_levels") or {}).get("tp"))
+                        cur_tp = _as_decimal(cur_tp_raw) if cur_tp_raw is not None else None
+                    except Exception:
+                        cur_tp = None
+                    tp_use = cur_tp if (cur_tp is not None and _is_pos_finite_decimal(cur_tp)) else tp
+                    if tp_use is None or not _is_pos_finite_decimal(tp_use):
+                        logger.info("ANCHOR_OPEN trailing skipped: TP unknown (ticker=%s)", self.cfg.ticker)
+                        return
+
+                    if self._round_price(new_sl) == self._round_price(cur_sl):
+                        return
+
+                    logger.info(
+                        "ANCHOR_OPEN trailing SL: prev_open=%s prev_close=%s %s %s current_sl=%s trail=%s -> new_sl=%s",
+                        str(po),
+                        str(pc),
+                        d,
+                        self.cfg.ticker,
+                        str(cur_sl),
+                        str(trail_r),
+                        str(self._round_price(new_sl)),
+                    )
+                    await self._cancel_exits()
+                    await self._ensure_oco_exits(pos, tp_use, new_sl, direction=d)
             return
 
         # 3) If no position and no active trade, decide once per anchor.
