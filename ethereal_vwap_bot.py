@@ -1001,6 +1001,10 @@ class EtherealVWAPStrategy:
         if not _is_pos_finite_decimal(tp_px) or not _is_pos_finite_decimal(sl_px):
             return
 
+        # Enforce tickSize rounding for stop prices (and store rounded values).
+        tp_px = self._round_price(tp_px)
+        sl_px = self._round_price(sl_px)
+
         # Close direction
         exit_side = 1 if d == "LONG" else 0
         group_id = str(uuid.uuid4())
@@ -1986,7 +1990,9 @@ class EtherealVWAPStrategy:
             # Apply trailing stop rule (relative to current SL, using prev candle body).
             trail = self._trailing_sl_candidate(trade_direction=self.direction, current_sl=cur_sl)
             if trail is not None and _is_pos_finite_decimal(trail):
-                new_sl = self._tightened_sl(current_sl=new_sl, desired_sl=trail)
+                # Round trailing candidate to tick size before comparing/applying.
+                trail_r = self._round_price(trail)
+                new_sl = self._tightened_sl(current_sl=new_sl, desired_sl=trail_r)
 
             # If we have exits, refresh them with the tightened SL logic.
             if self.state.get("exit_order_ids"):
@@ -2010,8 +2016,21 @@ class EtherealVWAPStrategy:
                         logger.info("SL not widened (LONG): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
                     if self.direction == "SHORT" and sl_px > cur_sl:
                         logger.info("SL not widened (SHORT): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
-                if trail is not None and cur_sl is not None and _is_pos_finite_decimal(cur_sl) and _is_pos_finite_decimal(trail):
-                    logger.info("Trailing SL candidate: current_sl=%s trail=%s -> chosen=%s", str(cur_sl), str(trail), str(new_sl))
+                if cur_sl is not None and _is_pos_finite_decimal(cur_sl):
+                    try:
+                        po = _as_decimal(self.state.get("prev_candle_open_price"))
+                        pc = _as_decimal(self.state.get("prev_candle_close_price"))
+                    except Exception:
+                        po, pc = Decimal("NaN"), Decimal("NaN")
+                    if trail is not None and _is_pos_finite_decimal(trail):
+                        logger.info(
+                            "Trailing SL candidate: prev_open=%s prev_close=%s current_sl=%s trail=%s -> chosen=%s",
+                            str(po),
+                            str(pc),
+                            str(cur_sl),
+                            str(self._round_price(trail)),
+                            str(self._round_price(new_sl)),
+                        )
 
                 await self._cancel_exits()
                 await self._ensure_oco_exits(pos, tp_px, new_sl)
