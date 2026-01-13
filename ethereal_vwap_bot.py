@@ -69,9 +69,14 @@ class StrategyConfig:
 
     # Trailing stop (applies to both strategies when enabled):
     # For each new candle, look at the previous candle body:
-    # - If trade is LONG and prev candle is bearish (close < open) => tighten SL by (open-close)
-    # - If trade is SHORT and prev candle is bullish (close > open) => tighten SL by (close-open)
+    # - If trailing_candle_filter == "opposite" (original rule):
+    #   - LONG: act only if prev candle is bearish (close < open) => tighten SL by (open-close)
+    #   - SHORT: act only if prev candle is bullish (close > open) => tighten SL by (close-open)
+    # - If trailing_candle_filter == "all" (test mode):
+    #   - LONG: always tighten SL by abs(close-open)
+    #   - SHORT: always tighten SL by abs(close-open)
     trailing_stop_enabled: bool = False
+    trailing_candle_filter: str = "all"  # "all" | "opposite"
     # Extra verbose logs for trailing stop and candle tracking.
     trailing_debug_logs: bool = False
 
@@ -1661,6 +1666,9 @@ class EtherealVWAPStrategy:
             return None
         if not bool(getattr(self.cfg, "trailing_stop_enabled", False)):
             return None
+        mode = str(getattr(self.cfg, "trailing_candle_filter", "all") or "all").strip().lower()
+        if mode not in {"all", "opposite"}:
+            mode = "all"
 
         d = (trade_direction or "").strip().upper()
         if d not in {"LONG", "SHORT"}:
@@ -1674,6 +1682,14 @@ class EtherealVWAPStrategy:
         if not _is_pos_finite_decimal(o) or not _is_pos_finite_decimal(c) or o == c:
             return None
 
+        # "all" mode: always tighten by abs body.
+        if mode == "all":
+            body = (c - o).copy_abs()
+            if body <= 0:
+                return None
+            return (current_sl + body) if d == "LONG" else (current_sl - body)
+
+        # "opposite" mode (original rule):
         # LONG: move SL up only if prev candle bearish (close < open)
         if d == "LONG" and c < o:
             body = o - c
@@ -1699,6 +1715,10 @@ class EtherealVWAPStrategy:
         if not bool(getattr(self.cfg, "trailing_stop_enabled", False)):
             out["reason"] = "disabled"
             return out
+        mode = str(getattr(self.cfg, "trailing_candle_filter", "all") or "all").strip().lower()
+        if mode not in {"all", "opposite"}:
+            mode = "all"
+        out["mode"] = mode
 
         d = (trade_direction or "").strip().upper()
         if d not in {"LONG", "SHORT"}:
@@ -1724,6 +1744,20 @@ class EtherealVWAPStrategy:
         # Determine candle sign
         out["candle_sign"] = "bull" if c > o else "bear"
 
+        # "all" mode: always tighten by abs body.
+        if mode == "all":
+            body = (c - o).copy_abs()
+            out["body"] = body
+            if body <= 0:
+                out["reason"] = "zero_body"
+                return out
+            cand = (current_sl + body) if d == "LONG" else (current_sl - body)
+            out["candidate_raw"] = cand
+            out["eligible"] = True
+            out["reason"] = "all_candles"
+            return out
+
+        # "opposite" mode (original rule)
         # LONG: act only on bearish candle
         if d == "LONG":
             if c >= o:
@@ -2213,6 +2247,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 strategy=str(raw.get("strategy", "vwap")),
                 deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
                 trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
+                trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
                 ticker=str(raw.get("ticker", "SOLUSD")),
                 direction=str(raw.get("direction", "LONG")).upper(),
                 poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -2254,6 +2289,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "strategy": cfg.strategy,
                 "deposit_usd": str(cfg.deposit_usd),
                 "trailing_stop_enabled": cfg.trailing_stop_enabled,
+                "trailing_candle_filter": cfg.trailing_candle_filter,
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "poll_interval_sec": cfg.poll_interval_sec,
@@ -2307,6 +2343,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         strategy=str(raw.get("strategy", "vwap")),
         deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
         trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
+        trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
         ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
         direction=str(raw.get("direction", "LONG")).strip().upper(),
         poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -2345,6 +2382,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "strategy": str(getattr(cfg, "strategy", "vwap")),
         "deposit_usd": str(getattr(cfg, "deposit_usd", Decimal("0"))),
         "trailing_stop_enabled": bool(getattr(cfg, "trailing_stop_enabled", False)),
+        "trailing_candle_filter": str(getattr(cfg, "trailing_candle_filter", "all")),
         "ticker": cfg.ticker,
         "direction": cfg.direction,
         "poll_interval_sec": cfg.poll_interval_sec,
