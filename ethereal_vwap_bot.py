@@ -67,6 +67,12 @@ class StrategyConfig:
     # Used only for reporting PnL statistics (% is relative to this deposit, per strategy config).
     deposit_usd: Decimal = Decimal("0")
 
+    # Trailing stop (applies to both strategies when enabled):
+    # For each new candle, look at the previous candle body:
+    # - If trade is LONG and prev candle is bearish (close < open) => tighten SL by (open-close)
+    # - If trade is SHORT and prev candle is bullish (close > open) => tighten SL by (close-open)
+    trailing_stop_enabled: bool = False
+
     ticker: str = "SOLUSD"
     direction: str = "LONG"  # LONG|SHORT
     poll_interval_sec: int = 3
@@ -278,6 +284,14 @@ class EtherealVWAPStrategy:
         self.state.setdefault("pending_entry_price", None)  # str Decimal
         self.state.setdefault("pending_entry_qty", None)  # str Decimal
         self.state.setdefault("pending_entry_at", None)
+
+        # Candle tracking for trailing stop (prices use reference price from get_oracle_price()).
+        self.state.setdefault("candle_open_price", None)  # str Decimal
+        self.state.setdefault("candle_close_price", None)  # str Decimal
+        self.state.setdefault("candle_start_ms", 0)
+        self.state.setdefault("prev_candle_open_price", None)  # str Decimal
+        self.state.setdefault("prev_candle_close_price", None)  # str Decimal
+        self.state.setdefault("prev_candle_start_ms", 0)
         # Last known oracle price snapshot (for robust anchor transitions in anchor_open).
         self.state.setdefault("last_price", None)  # str Decimal
         self.state.setdefault("last_price_ms", 0)
@@ -1358,6 +1372,7 @@ class EtherealVWAPStrategy:
         vwap: Decimal,
         pos: Optional[dict],
         has_pos: bool,
+        is_new_candle: bool,
     ) -> None:
         """
         Strategy "anchor_open":
@@ -1389,6 +1404,44 @@ class EtherealVWAPStrategy:
                     d = "LONG"
                 if (tp == tp) and tp > 0 and (sl == sl) and sl > 0:
                     await self._ensure_oco_exits(pos, self._round_price(tp), self._round_price(sl), direction=d)
+            else:
+                # Trailing stop for anchor_open: adjust SL on new candle based on previous candle body.
+                if is_new_candle and bool(getattr(self.cfg, "trailing_stop_enabled", False)):
+                    d = str(self.state.get("anchor_open_direction") or "").upper() or "LONG"
+                    if d not in {"LONG", "SHORT"}:
+                        d = "LONG"
+                    # Ensure we know current SL.
+                    if not (self.state.get("exit_levels") or {}).get("sl"):
+                        await self._hydrate_exit_levels_from_api()
+                    try:
+                        cur_sl_raw = ((self.state.get("exit_levels") or {}).get("sl"))
+                        cur_sl = _as_decimal(cur_sl_raw) if cur_sl_raw is not None else None
+                    except Exception:
+                        cur_sl = None
+                    if cur_sl is not None and _is_pos_finite_decimal(cur_sl):
+                        trail = self._trailing_sl_candidate(trade_direction=d, current_sl=cur_sl)
+                        if trail is not None and _is_pos_finite_decimal(trail):
+                            new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=trail)
+                            # Use cached TP (prefer exit_levels, fallback anchor_open_tp_price).
+                            tp = self._decimal_from_state("anchor_open_tp_price") or self._decimal_from_state("prev_anchor_vwap")
+                            try:
+                                cur_tp_raw = ((self.state.get("exit_levels") or {}).get("tp"))
+                                cur_tp = _as_decimal(cur_tp_raw) if cur_tp_raw is not None else None
+                            except Exception:
+                                cur_tp = None
+                            tp_use = cur_tp if (cur_tp is not None and _is_pos_finite_decimal(cur_tp)) else tp
+                            if tp_use is not None and _is_pos_finite_decimal(tp_use):
+                                if self._round_price(new_sl) != self._round_price(cur_sl):
+                                    logger.info(
+                                        "ANCHOR_OPEN trailing SL: %s %s current_sl=%s trail=%s -> new_sl=%s",
+                                        d,
+                                        self.cfg.ticker,
+                                        str(cur_sl),
+                                        str(trail),
+                                        str(new_sl),
+                                    )
+                                    await self._cancel_exits()
+                                    await self._ensure_oco_exits(pos, self._round_price(tp_use), self._round_price(new_sl), direction=d)
             return
 
         # 3) If no position and no active trade, decide once per anchor.
@@ -1546,6 +1599,38 @@ class EtherealVWAPStrategy:
         # SHORT
         return desired_sl if desired_sl < current_sl else current_sl
 
+    def _trailing_sl_candidate(self, *, trade_direction: str, current_sl: Optional[Decimal]) -> Optional[Decimal]:
+        """
+        Compute trailing SL candidate from the previous candle body, according to the requested rule.
+        Uses prev_candle_open_price/prev_candle_close_price tracked from reference price.
+        """
+        if current_sl is None or not _is_pos_finite_decimal(current_sl):
+            return None
+        if not bool(getattr(self.cfg, "trailing_stop_enabled", False)):
+            return None
+
+        d = (trade_direction or "").strip().upper()
+        if d not in {"LONG", "SHORT"}:
+            return None
+
+        try:
+            o = _as_decimal(self.state.get("prev_candle_open_price"))
+            c = _as_decimal(self.state.get("prev_candle_close_price"))
+        except Exception:
+            return None
+        if not _is_pos_finite_decimal(o) or not _is_pos_finite_decimal(c) or o == c:
+            return None
+
+        # LONG: move SL up only if prev candle bearish (close < open)
+        if d == "LONG" and c < o:
+            body = o - c
+            return current_sl + body
+        # SHORT: move SL down only if prev candle bullish (close > open)
+        if d == "SHORT" and c > o:
+            body = c - o
+            return current_sl - body
+        return None
+
     def _cached_exit_levels(self) -> tuple[Optional[Decimal], Optional[Decimal]]:
         """Return cached (tp, sl) from state.exit_levels if both are valid."""
         levels = self.state.get("exit_levels") or {}
@@ -1680,6 +1765,15 @@ class EtherealVWAPStrategy:
         candle_start_ms = now_ms - (now_ms % tf_ms)
         is_new_candle = int(self.state.get("last_candle_start_ms") or 0) != candle_start_ms
         if is_new_candle:
+            # Finalize previous candle tracking (for trailing stop)
+            self.state["prev_candle_open_price"] = self.state.get("candle_open_price")
+            self.state["prev_candle_close_price"] = self.state.get("candle_close_price")
+            self.state["prev_candle_start_ms"] = int(self.state.get("candle_start_ms") or 0)
+            # Reset current candle
+            self.state["candle_open_price"] = None
+            self.state["candle_close_price"] = None
+            self.state["candle_start_ms"] = int(candle_start_ms)
+
             self.state["last_candle_start_ms"] = candle_start_ms
             self._save_state()
             logger.info("NEW CANDLE %s — full refresh", _ms_to_dt(candle_start_ms).isoformat())
@@ -1696,6 +1790,15 @@ class EtherealVWAPStrategy:
             self.state["last_price_anchor_ms"] = int(anchor_start_ms)
             if prev_saved <= 0 or (price - prev_saved).copy_abs() / price > Decimal("0.0005"):
                 self._save_state()
+
+            # Update candle open/close tracking from reference price.
+            if int(self.state.get("candle_start_ms") or 0) != int(candle_start_ms):
+                self.state["candle_start_ms"] = int(candle_start_ms)
+                self.state["candle_open_price"] = None
+                self.state["candle_close_price"] = None
+            if self.state.get("candle_open_price") is None:
+                self.state["candle_open_price"] = str(price)
+            self.state["candle_close_price"] = str(price)
 
         # Persist last known VWAP snapshot for anchor_open TP (works for any vwap_source).
         if (vwap == vwap) and vwap > 0:
@@ -1782,6 +1885,7 @@ class EtherealVWAPStrategy:
                 vwap=vwap,
                 pos=pos,
                 has_pos=has_pos,
+                is_new_candle=is_new_candle,
             )
             return
 
@@ -1877,7 +1981,12 @@ class EtherealVWAPStrategy:
                 logger.info("EXITS unchanged: current SL unknown (missing cache). Keeping existing TP/SL.")
                 return
 
+            # Start with VWAP-derived SL tightening.
             new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=sl_px)
+            # Apply trailing stop rule (relative to current SL, using prev candle body).
+            trail = self._trailing_sl_candidate(trade_direction=self.direction, current_sl=cur_sl)
+            if trail is not None and _is_pos_finite_decimal(trail):
+                new_sl = self._tightened_sl(current_sl=new_sl, desired_sl=trail)
 
             # If we have exits, refresh them with the tightened SL logic.
             if self.state.get("exit_order_ids"):
@@ -1901,6 +2010,8 @@ class EtherealVWAPStrategy:
                         logger.info("SL not widened (LONG): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
                     if self.direction == "SHORT" and sl_px > cur_sl:
                         logger.info("SL not widened (SHORT): current_sl=%s desired_sl=%s -> keeping %s", str(cur_sl), str(sl_px), str(new_sl))
+                if trail is not None and cur_sl is not None and _is_pos_finite_decimal(cur_sl) and _is_pos_finite_decimal(trail):
+                    logger.info("Trailing SL candidate: current_sl=%s trail=%s -> chosen=%s", str(cur_sl), str(trail), str(new_sl))
 
                 await self._cancel_exits()
                 await self._ensure_oco_exits(pos, tp_px, new_sl)
@@ -1942,6 +2053,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
             StrategyConfig(
                 strategy=str(raw.get("strategy", "vwap")),
                 deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
+                trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
                 ticker=str(raw.get("ticker", "SOLUSD")),
                 direction=str(raw.get("direction", "LONG")).upper(),
                 poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -1982,6 +2094,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
             {
                 "strategy": cfg.strategy,
                 "deposit_usd": str(cfg.deposit_usd),
+                "trailing_stop_enabled": cfg.trailing_stop_enabled,
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "poll_interval_sec": cfg.poll_interval_sec,
@@ -2034,6 +2147,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
     return StrategyConfig(
         strategy=str(raw.get("strategy", "vwap")),
         deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
+        trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
         ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
         direction=str(raw.get("direction", "LONG")).strip().upper(),
         poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -2071,6 +2185,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
     return {
         "strategy": str(getattr(cfg, "strategy", "vwap")),
         "deposit_usd": str(getattr(cfg, "deposit_usd", Decimal("0"))),
+        "trailing_stop_enabled": bool(getattr(cfg, "trailing_stop_enabled", False)),
         "ticker": cfg.ticker,
         "direction": cfg.direction,
         "poll_interval_sec": cfg.poll_interval_sec,
