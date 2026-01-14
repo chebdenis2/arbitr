@@ -260,6 +260,8 @@ class EtherealVWAPStrategy:
         self.state.setdefault("exit_group_id", None)
         # When exits were last placed (ms since epoch), used to avoid reacting to transient 404s.
         self.state.setdefault("exit_placed_ms", 0)
+        # Best-effort exit quantity tracking (used for anchor_open immediate protection).
+        self.state.setdefault("exit_qty", None)  # str Decimal
         self.state.setdefault("trading_paused", False)
         self.state.setdefault("pause_reason", None)
         self.state.setdefault("paused_at", None)
@@ -745,6 +747,7 @@ class EtherealVWAPStrategy:
         self.state["exit_levels"] = {"tp": None, "sl": None}
         self.state["exit_group_id"] = None
         self.state["exit_placed_ms"] = 0
+        self.state["exit_qty"] = None
 
     async def _confirm_order_status(self, order_id: str) -> Optional[str]:
         """Fetch order by id and return status (upper)."""
@@ -1119,8 +1122,81 @@ class EtherealVWAPStrategy:
             self.state["exit_levels"] = {"tp": str(tp_px), "sl": str(sl_px)}
             self.state["exit_group_id"] = group_id
             self.state["exit_placed_ms"] = _dt_to_ms(_utc_now())
+            self.state["exit_qty"] = str(qty)
             self._save_state()
             logger.info("EXITS placed (OCO): TP=%s SL=%s qty=%s group=%s", tp_px, sl_px, qty, group_id)
+        except Exception as e:
+            logger.error("Failed to place exits: %s", e)
+
+    async def _place_oco_exits_for_qty(self, *, qty: Decimal, tp_px: Decimal, sl_px: Decimal, direction: str) -> None:
+        """
+        Place OCO exits using an explicit quantity (used for anchor_open immediate protection).
+        This avoids waiting for position visibility, so a new anchor_open entry isn't left without TP/SL.
+        """
+        if self.state.get("exit_order_ids"):
+            return
+        q = self._round_qty(qty)
+        if not _is_pos_finite_decimal(q):
+            return
+        d = (direction or "LONG").strip().upper()
+        if d not in {"LONG", "SHORT"}:
+            d = "LONG"
+        if not _is_pos_finite_decimal(tp_px) or not _is_pos_finite_decimal(sl_px):
+            return
+        tp_px = self._round_price(tp_px)
+        sl_px = self._round_price(sl_px)
+        exit_side = 1 if d == "LONG" else 0
+        group_id = str(uuid.uuid4())
+        try:
+            sender = getattr(getattr(self.client, "chain", None), "address", None)
+            order_type = "MARKET" if self.cfg.exits_as_stop_market else "LIMIT"
+            expires_at = int(time.time()) + int(self.cfg.exit_expires_in_sec)
+            tp = await self.client.create_order(
+                order_type=order_type,
+                product_id=self.product_id,
+                ticker=self.cfg.ticker,
+                side=exit_side,
+                quantity=float(q),
+                reduce_only=True,
+                stop_type=0,
+                stop_price=float(tp_px),
+                price=(float(tp_px) if order_type == "LIMIT" else None),
+                time_in_force="GTD",
+                expires_at=expires_at,
+                client_order_id=self._mk_client_order_id("TP"),
+                group_id=group_id,
+                group_contingency_type=1,  # OCO
+                sender=sender,
+                subaccount=self.subaccount_name,
+            )
+            sl = await self.client.create_order(
+                order_type=order_type,
+                product_id=self.product_id,
+                ticker=self.cfg.ticker,
+                side=exit_side,
+                quantity=float(q),
+                reduce_only=True,
+                stop_type=1,
+                stop_price=float(sl_px),
+                price=(float(sl_px) if order_type == "LIMIT" else None),
+                time_in_force="GTD",
+                expires_at=expires_at,
+                client_order_id=self._mk_client_order_id("SL"),
+                group_id=group_id,
+                group_contingency_type=1,  # OCO
+                sender=sender,
+                subaccount=self.subaccount_name,
+            )
+            tp_id = str(getattr(tp, "id"))
+            sl_id = str(getattr(sl, "id"))
+            self.state["exit_order_ids"] = [tp_id, sl_id]
+            self.state["exit_orders"] = {"tp": tp_id, "sl": sl_id}
+            self.state["exit_levels"] = {"tp": str(tp_px), "sl": str(sl_px)}
+            self.state["exit_group_id"] = group_id
+            self.state["exit_placed_ms"] = _dt_to_ms(_utc_now())
+            self.state["exit_qty"] = str(q)
+            self._save_state()
+            logger.info("EXITS placed (OCO): TP=%s SL=%s qty=%s group=%s", tp_px, sl_px, q, group_id)
         except Exception as e:
             logger.error("Failed to place exits: %s", e)
 
@@ -1393,6 +1469,27 @@ class EtherealVWAPStrategy:
                 if (tp == tp) and tp > 0 and (sl == sl) and sl > 0:
                     await self._ensure_oco_exits(pos, self._round_price(tp), self._round_price(sl), direction=d)
             else:
+                # If exits were placed with a provisional qty but position size differs, refresh exits to exact size.
+                try:
+                    want = _as_decimal(self.state.get("exit_qty") or "0")
+                except Exception:
+                    want = Decimal("0")
+                have = _as_decimal(pos.get("size") or "0").copy_abs()
+                have_q = self._round_qty(have)
+                want_q = self._round_qty(want) if _is_pos_finite_decimal(want) else have_q
+                if _is_pos_finite_decimal(have_q) and _is_pos_finite_decimal(want_q) and have_q != want_q:
+                    try:
+                        tp = _as_decimal(self.state.get("anchor_open_tp_price"))
+                        sl = _as_decimal(self.state.get("anchor_open_sl_price"))
+                    except Exception:
+                        tp = Decimal("NaN")
+                        sl = Decimal("NaN")
+                    if _is_pos_finite_decimal(tp) and _is_pos_finite_decimal(sl):
+                        logger.warning("ANCHOR_OPEN exits qty refresh: %s %s %s -> %s", d, self.cfg.ticker, str(want_q), str(have_q))
+                        await self._cancel_exits()
+                        await self._ensure_oco_exits(pos, self._round_price(tp), self._round_price(sl), direction=d)
+                        return
+
                 # Trailing stop for anchor_open: adjust SL on new candle based on previous candle body.
                 if is_new_candle and bool(getattr(self.cfg, "trailing_stop_enabled", False)):
                     d = str(self.state.get("anchor_open_direction") or "").upper() or "LONG"
@@ -1586,6 +1683,15 @@ class EtherealVWAPStrategy:
         self.state["anchor_open_opened_at"] = now.isoformat()
         self.state["anchor_open_decision_anchor_ms"] = int(anchor_start_ms)
         self._save_state()
+
+        # Immediate protection: place TP/SL using configured entry qty (do not wait for position visibility).
+        # This prevents anchor_open entries from being unprotected when the position endpoint lags.
+        await self._place_oco_exits_for_qty(
+            qty=qty,
+            tp_px=tp_price,
+            sl_px=sl_price,
+            direction=trade_dir,
+        )
 
         logger.warning(
             "ANCHOR_OPEN ENTRY: %s %s qty=%s (order_id=%s) prev_vwap=%s open=%s delta_pct=%s thr=%s TP=%s SL=%s sl_pct_of_tp=%s tp_size=%s",
