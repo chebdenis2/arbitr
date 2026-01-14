@@ -69,9 +69,6 @@ class StrategyConfig:
     # - "anchor_open": new logic (market entry on new anchor + TP to last VWAP of prev anchor + SL from TP size + close at anchor end)
     strategy: str = "vwap"
 
-    # Used only for reporting PnL statistics (% is relative to this deposit, per strategy config).
-    deposit_usd: Decimal = Decimal("0")
-
     # Trailing stop (applies to both strategies when enabled):
     # For each new candle, look at the previous candle RANGE:
     #   range = high - low
@@ -235,13 +232,6 @@ class EtherealVWAPStrategy:
             self.subaccount_name,
             str(self.subaccount_id),
         )
-        # Initialize stats deposit if missing.
-        if self.state.get("stats_deposit_usd") is None:
-            dep = _as_decimal(getattr(self.cfg, "deposit_usd", "0") or "0")
-            if _is_pos_finite_decimal(dep):
-                self.state["stats_deposit_usd"] = str(dep)
-                self._save_state()
-        self._log_stats_snapshot(prefix="STATS INIT")
         # Note: linked signers are optional. The subaccount owner can trade without linking a separate signer.
 
     # ---------------------------
@@ -288,26 +278,6 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_position_size", "0")
         self.state.setdefault("last_close_reason", None)
         self.state.setdefault("last_close_at", None)
-
-        # Stats (per state file, i.e. per ticker+direction)
-        self.state.setdefault("stats_deposit_usd", None)  # str Decimal
-        self.state.setdefault("stats_realized_pnl_usd", "0")
-        self.state.setdefault("stats_wins", 0)
-        self.state.setdefault("stats_losses", 0)
-        self.state.setdefault("stats_trades", 0)
-
-        # Active trade tracking (best-effort stats)
-        self.state.setdefault("trade_active", False)
-        self.state.setdefault("trade_mode", None)  # vwap|anchor_open
-        self.state.setdefault("trade_direction", None)  # LONG|SHORT
-        self.state.setdefault("trade_entry_price", None)  # str Decimal
-        self.state.setdefault("trade_entry_qty", None)  # str Decimal
-        self.state.setdefault("trade_opened_at", None)
-
-        # Pending entry (vwap strategy): used to estimate entry when position opens.
-        self.state.setdefault("pending_entry_price", None)  # str Decimal
-        self.state.setdefault("pending_entry_qty", None)  # str Decimal
-        self.state.setdefault("pending_entry_at", None)
 
         # Candle tracking for trailing stop (prices use reference price from get_oracle_price()).
         self.state.setdefault("candle_open_price", None)  # str Decimal
@@ -1059,9 +1029,6 @@ class EtherealVWAPStrategy:
 
             self.state["entry_order_id"] = oid
             # Pending entry (used for stats when a position becomes visible).
-            self.state["pending_entry_price"] = str(px)
-            self.state["pending_entry_qty"] = str(qty)
-            self.state["pending_entry_at"] = _utc_now().isoformat()
             self._save_state()
             logger.info(
                 "ENTRY placed: %s qty=%s px=%s (order_id=%s status=%s result=%s filled=%s)",
@@ -1270,15 +1237,6 @@ class EtherealVWAPStrategy:
             self._clear_anchor_open_state(reason=reason)
 
         # Update stats (best-effort) using exit trigger prices.
-        exit_px: Optional[Decimal]
-        if str(reason or "").upper() == "TP":
-            exit_px = tp_px
-        elif str(reason or "").upper() == "SL":
-            exit_px = sl_px
-        else:
-            exit_px = None
-        self._update_stats_on_close(reason=reason, exit_px=exit_px)
-
         if reason == "SL":
             pause_min = self._pause_after_sl_minutes()
             if pause_min > 0:
@@ -1305,76 +1263,6 @@ class EtherealVWAPStrategy:
             return "vwap"
         return s or "vwap"
 
-    def _log_stats_snapshot(self, *, prefix: str) -> None:
-        try:
-            dep = _as_decimal(self.state.get("stats_deposit_usd") or "0")
-        except Exception:
-            dep = Decimal("0")
-        pnl = _as_decimal(self.state.get("stats_realized_pnl_usd") or "0")
-        wins = int(self.state.get("stats_wins") or 0)
-        losses = int(self.state.get("stats_losses") or 0)
-        trades = int(self.state.get("stats_trades") or 0)
-        pnl_pct = (pnl / dep * Decimal("100")) if _is_pos_finite_decimal(dep) else Decimal("NaN")
-        logger.info(
-            "%s: %s %s trades=%s wins=%s losses=%s realized_pnl_usd=%s realized_pnl_pct=%s deposit_usd=%s",
-            prefix,
-            self.cfg.ticker,
-            self.direction,
-            trades,
-            wins,
-            losses,
-            str(pnl),
-            str(pnl_pct),
-            str(dep),
-        )
-
-    def _update_stats_on_close(self, *, reason: str, exit_px: Optional[Decimal]) -> None:
-        """
-        Best-effort PnL calculation in USD:
-          pnl = qty * (exit_price - entry_price) for LONG
-          pnl = qty * (entry_price - exit_price) for SHORT
-        """
-        if not self.state.get("trade_active"):
-            return
-
-        d = str(self.state.get("trade_direction") or self.direction or "LONG").upper()
-        if d not in {"LONG", "SHORT"}:
-            d = "LONG"
-
-        entry_px = self._decimal_from_state("trade_entry_price")
-        qty = self._decimal_from_state("trade_entry_qty")
-        if entry_px is None or qty is None or exit_px is None or not _is_pos_finite_decimal(exit_px):
-            # Can't compute reliably; clear active trade without updating stats.
-            self.state["trade_active"] = False
-            self.state["trade_mode"] = None
-            self.state["trade_direction"] = None
-            self.state["trade_entry_price"] = None
-            self.state["trade_entry_qty"] = None
-            self.state["trade_opened_at"] = None
-            self._save_state()
-            return
-
-        pnl = (qty * (exit_px - entry_px)) if d == "LONG" else (qty * (entry_px - exit_px))
-
-        self.state["stats_trades"] = int(self.state.get("stats_trades") or 0) + 1
-        if pnl > 0:
-            self.state["stats_wins"] = int(self.state.get("stats_wins") or 0) + 1
-        elif pnl < 0:
-            self.state["stats_losses"] = int(self.state.get("stats_losses") or 0) + 1
-
-        cur = _as_decimal(self.state.get("stats_realized_pnl_usd") or "0")
-        self.state["stats_realized_pnl_usd"] = str(cur + pnl)
-
-        # Clear active trade
-        self.state["trade_active"] = False
-        self.state["trade_mode"] = None
-        self.state["trade_direction"] = None
-        self.state["trade_entry_price"] = None
-        self.state["trade_entry_qty"] = None
-        self.state["trade_opened_at"] = None
-        self._save_state()
-
-        self._log_stats_snapshot(prefix=f"STATS CLOSE {str(reason).upper()} pnl_usd={pnl}")
 
     def _clear_anchor_open_state(self, *, reason: str) -> None:
         self.state["anchor_open_active"] = False
@@ -2226,31 +2114,6 @@ class EtherealVWAPStrategy:
         self.state["last_position_size"] = str(pos_size)
         # NOTE: we save state only on meaningful events to avoid excessive writes.
 
-        # Trade open detection (for stats): when a position becomes visible and we haven't marked a trade as active.
-        if has_pos and not self.state.get("trade_active"):
-            mode = self._cfg_strategy()
-            if mode == "anchor_open":
-                d = str(self.state.get("anchor_open_direction") or self.direction or "LONG").upper()
-                ep = self._price_from_state("anchor_open_open_price") or self._price_from_state("pending_entry_price") or (price if _is_pos_finite_decimal(price) else None)
-            else:
-                d = str(self.direction or "LONG").upper()
-                ep = self._price_from_state("pending_entry_price") or (price if _is_pos_finite_decimal(price) else None)
-            if d not in {"LONG", "SHORT"}:
-                d = "LONG"
-            if ep is not None and _is_pos_finite_decimal(pos_size):
-                self.state["trade_active"] = True
-                self.state["trade_mode"] = mode
-                self.state["trade_direction"] = d
-                self.state["trade_entry_price"] = str(ep)
-                self.state["trade_entry_qty"] = str(pos_size)
-                self.state["trade_opened_at"] = _utc_now().isoformat()
-                # Clear pending entry hints
-                self.state["pending_entry_price"] = None
-                self.state["pending_entry_qty"] = None
-                self.state["pending_entry_at"] = None
-                self._save_state()
-                logger.info("STATS OPEN: %s %s mode=%s entry_px=%s qty=%s", d, self.cfg.ticker, mode, str(ep), str(pos_size))
-
         # Handle pause-after-SL (timer model)
         if self.state.get("trading_paused"):
             now_ts = int(now.timestamp())
@@ -2477,7 +2340,6 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
         return (
             StrategyConfig(
                 strategy=str(raw.get("strategy", "vwap")),
-                deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
                 trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
                 trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
                 trailing_prev_candle_source=str(raw.get("trailing_prev_candle_source", "auto")),
@@ -2520,7 +2382,6 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
         json.dump(
             {
                 "strategy": cfg.strategy,
-                "deposit_usd": str(cfg.deposit_usd),
                 "trailing_stop_enabled": cfg.trailing_stop_enabled,
                 "trailing_candle_filter": cfg.trailing_candle_filter,
                 "trailing_prev_candle_source": cfg.trailing_prev_candle_source,
@@ -2575,7 +2436,6 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
     trades_page_limit = min(max(trades_page_limit, 1), 200)  # clamp to API max
     return StrategyConfig(
         strategy=str(raw.get("strategy", "vwap")),
-        deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
         trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
         trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
         trailing_prev_candle_source=str(raw.get("trailing_prev_candle_source", "auto")),
@@ -2615,7 +2475,6 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
 def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
     return {
         "strategy": str(getattr(cfg, "strategy", "vwap")),
-        "deposit_usd": str(getattr(cfg, "deposit_usd", Decimal("0"))),
         "trailing_stop_enabled": bool(getattr(cfg, "trailing_stop_enabled", False)),
         "trailing_candle_filter": str(getattr(cfg, "trailing_candle_filter", "all")),
         "trailing_prev_candle_source": str(getattr(cfg, "trailing_prev_candle_source", "auto")),
