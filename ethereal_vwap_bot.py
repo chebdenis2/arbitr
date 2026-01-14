@@ -82,6 +82,11 @@ class StrategyConfig:
     #   - SHORT: always tighten SL by abs(close-open)
     trailing_stop_enabled: bool = False
     trailing_candle_filter: str = "all"  # "all" | "opposite"
+    # Where to take previous candle open/close for trailing:
+    # - "state": use candle tracking from ref_price sampling (default)
+    # - "bybit_klines": fetch previous candle OHLC from Bybit (more reliable when vwap_source=bybit_klines)
+    # - "auto": use state, fallback to bybit_klines when missing
+    trailing_prev_candle_source: str = "auto"
     # Extra verbose logs for trailing stop and candle tracking.
     trailing_debug_logs: bool = False
 
@@ -1514,7 +1519,7 @@ class EtherealVWAPStrategy:
                         return
 
                     # Compute trailing candidate; it is only produced for "opposite" candles by definition.
-                    trail_info = self._trailing_decision(trade_direction=d, current_sl=cur_sl)
+                    trail_info = await self._trailing_decision_async(trade_direction=d, current_sl=cur_sl)
                     self._trailing_debug(
                         "TRAIL DEBUG: anchor_open trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_open=%s prev_close=%s body=%s current_sl=%s candidate_raw=%s",
                         self.cfg.ticker,
@@ -1779,7 +1784,89 @@ class EtherealVWAPStrategy:
         if bool(getattr(self.cfg, "trailing_debug_logs", False)):
             logger.info(msg, *args)
 
-    def _trailing_decision(self, *, trade_direction: str, current_sl: Optional[Decimal]) -> dict:
+    def _bybit_interval_for_timeframe(self) -> Optional[str]:
+        """
+        Map bot timeframe (e.g. 1m/5m/1h/4h/1d) to Bybit kline interval.
+        Returns interval string accepted by Bybit v5.
+        """
+        tf = (self.cfg.timeframe or "").strip().lower()
+        if not tf:
+            return None
+        num = ""
+        unit = ""
+        for ch in tf:
+            if ch.isdigit():
+                num += ch
+            else:
+                unit += ch
+        if not num or not unit:
+            return None
+        n = int(num)
+        if unit == "m":
+            return str(n)
+        if unit == "h":
+            return str(n * 60)
+        if unit == "d":
+            return "D" if n == 1 else None
+        return None
+
+    async def _bybit_prev_candle_open_close(self, prev_start_ms: int, tf_ms: int) -> Optional[tuple[Decimal, Decimal]]:
+        """
+        Fetch previous candle open/close from Bybit kline API.
+        Uses cfg.bybit_* settings.
+        """
+        interval = self._bybit_interval_for_timeframe()
+        if not interval:
+            return None
+        base_url = (self.cfg.bybit_base_url or "https://api.bybit.com").rstrip("/")
+        url = f"{base_url}/v5/market/kline"
+        category = str(self.cfg.bybit_category or "linear")
+        symbol = str(self.cfg.bybit_symbol or "")
+        if not symbol:
+            return None
+        start = int(prev_start_ms)
+        end = int(prev_start_ms + tf_ms - 1)
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(
+                    url,
+                    params={
+                        "category": category,
+                        "symbol": symbol,
+                        "interval": interval,
+                        "start": start,
+                        "end": end,
+                        "limit": 2,
+                    },
+                )
+                r.raise_for_status()
+                payload = r.json()
+                if str(payload.get("retCode")) != "0":
+                    return None
+                lst = (((payload.get("result") or {}).get("list")) or [])
+                if not lst:
+                    return None
+                # Each item: [startTime, open, high, low, close, volume, turnover]
+                rows = sorted(lst, key=lambda x: int(x[0]))
+                # Find candle matching prev_start_ms
+                for it in rows:
+                    if int(it[0]) != start:
+                        continue
+                    o = _as_decimal(it[1])
+                    cl = _as_decimal(it[4])
+                    if _is_pos_finite_decimal(o) and _is_pos_finite_decimal(cl):
+                        return o, cl
+                # Fallback to first row if exact match not found.
+                it = rows[0]
+                o = _as_decimal(it[1])
+                cl = _as_decimal(it[4])
+                if _is_pos_finite_decimal(o) and _is_pos_finite_decimal(cl):
+                    return o, cl
+        except Exception:
+            return None
+        return None
+
+    async def _trailing_decision_async(self, *, trade_direction: str, current_sl: Optional[Decimal]) -> dict:
         """
         Returns a dict with detailed trailing decision info for debugging.
         """
@@ -1794,24 +1881,49 @@ class EtherealVWAPStrategy:
         if mode not in {"all", "opposite"}:
             mode = "all"
         out["mode"] = mode
+        src = str(getattr(self.cfg, "trailing_prev_candle_source", "auto") or "auto").strip().lower()
+        if src not in {"state", "bybit_klines", "auto"}:
+            src = "auto"
+        out["candle_source"] = src
 
         d = (trade_direction or "").strip().upper()
         if d not in {"LONG", "SHORT"}:
             out["reason"] = "direction_invalid"
             return out
 
-        try:
-            o = _as_decimal(self.state.get("prev_candle_open_price"))
-            c = _as_decimal(self.state.get("prev_candle_close_price"))
-        except Exception:
+        o: Optional[Decimal] = None
+        c: Optional[Decimal] = None
+        # 1) Try state candle first (unless forced bybit_klines)
+        if src in {"state", "auto"}:
+            try:
+                o0 = _as_decimal(self.state.get("prev_candle_open_price"))
+                c0 = _as_decimal(self.state.get("prev_candle_close_price"))
+                if _is_pos_finite_decimal(o0) and _is_pos_finite_decimal(c0):
+                    o, c = o0, c0
+                    out["candle_source_used"] = "state"
+            except Exception:
+                pass
+
+        # 2) Fallback to Bybit klines if requested/needed
+        if (o is None or c is None) and src in {"bybit_klines", "auto"}:
+            # Prefer bybit fallback when vwap_source is bybit_klines (typical case).
+            vsrc = (self.cfg.vwap_source or "").strip().lower()
+            if src == "bybit_klines" or vsrc == "bybit_klines":
+                tf_ms = self._timeframe_ms(self.cfg.timeframe)
+                cur_start_ms = int(self.state.get("last_candle_start_ms") or 0)
+                prev_start_ms = int(self.state.get("prev_candle_start_ms") or 0) or (cur_start_ms - tf_ms)
+                if prev_start_ms > 0 and tf_ms > 0:
+                    oc = await self._bybit_prev_candle_open_close(prev_start_ms, tf_ms)
+                    if oc is not None:
+                        o, c = oc
+                    out["candle_source_used"] = "bybit_klines"
+
+        if o is None or c is None:
             out["reason"] = "prev_candle_missing"
             return out
 
         out["prev_open"] = o
         out["prev_close"] = c
-        if not _is_pos_finite_decimal(o) or not _is_pos_finite_decimal(c):
-            out["reason"] = "prev_candle_invalid"
-            return out
         if o == c:
             out["reason"] = "doji"
             return out
@@ -2230,7 +2342,7 @@ class EtherealVWAPStrategy:
             # Start with VWAP-derived SL tightening.
             new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=sl_px)
             # Apply trailing stop rule (relative to current SL, using prev candle body).
-            trail_info = self._trailing_decision(trade_direction=self.direction, current_sl=cur_sl)
+            trail_info = await self._trailing_decision_async(trade_direction=self.direction, current_sl=cur_sl)
             trail = None
             if bool(trail_info.get("eligible")):
                 try:
@@ -2329,6 +2441,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
                 trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
                 trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
+                trailing_prev_candle_source=str(raw.get("trailing_prev_candle_source", "auto")),
                 ticker=str(raw.get("ticker", "SOLUSD")),
                 direction=str(raw.get("direction", "LONG")).upper(),
                 poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -2371,6 +2484,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "deposit_usd": str(cfg.deposit_usd),
                 "trailing_stop_enabled": cfg.trailing_stop_enabled,
                 "trailing_candle_filter": cfg.trailing_candle_filter,
+                "trailing_prev_candle_source": cfg.trailing_prev_candle_source,
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "poll_interval_sec": cfg.poll_interval_sec,
@@ -2425,6 +2539,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         deposit_usd=_as_decimal(raw.get("deposit_usd", "0")),
         trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
         trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
+        trailing_prev_candle_source=str(raw.get("trailing_prev_candle_source", "auto")),
         ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
         direction=str(raw.get("direction", "LONG")).strip().upper(),
         poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -2464,6 +2579,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "deposit_usd": str(getattr(cfg, "deposit_usd", Decimal("0"))),
         "trailing_stop_enabled": bool(getattr(cfg, "trailing_stop_enabled", False)),
         "trailing_candle_filter": str(getattr(cfg, "trailing_candle_filter", "all")),
+        "trailing_prev_candle_source": str(getattr(cfg, "trailing_prev_candle_source", "auto")),
         "ticker": cfg.ticker,
         "direction": cfg.direction,
         "poll_interval_sec": cfg.poll_interval_sec,
