@@ -70,14 +70,14 @@ class StrategyConfig:
     strategy: str = "vwap"
 
     # Trailing stop (applies to both strategies when enabled):
-    # For each new candle, look at the previous candle RANGE:
-    #   range = high - low
+    # For each new candle, look at the previous candle BODY:
+    #   body = abs(close - open)
     # - If trailing_candle_filter == "opposite" (original rule):
     #   - LONG: act only if prev candle is bearish (close < open) => tighten SL by (open-close)
     #   - SHORT: act only if prev candle is bullish (close > open) => tighten SL by (close-open)
     # - If trailing_candle_filter == "all" (test mode):
-    #   - LONG: always tighten SL by (high-low)
-    #   - SHORT: always tighten SL by (high-low)
+    #   - LONG: always tighten SL by abs(close-open)
+    #   - SHORT: always tighten SL by abs(close-open)
     trailing_stop_enabled: bool = False
     trailing_candle_filter: str = "all"  # "all" | "opposite"
     # Which price stream to build candles for trailing stop:
@@ -1515,7 +1515,7 @@ class EtherealVWAPStrategy:
                     # Compute trailing candidate; it is only produced for "opposite" candles by definition.
                     trail_info = await self._trailing_decision_async(trade_direction=d, current_sl=cur_sl)
                     self._trailing_debug(
-                        "TRAIL DEBUG: anchor_open trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_o=%s prev_h=%s prev_l=%s prev_c=%s range=%s current_sl=%s candidate_raw=%s",
+                        "TRAIL DEBUG: anchor_open trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_o=%s prev_h=%s prev_l=%s prev_c=%s body=%s current_sl=%s candidate_raw=%s",
                         self.cfg.ticker,
                         d,
                         str(trail_info.get("eligible")),
@@ -1524,7 +1524,7 @@ class EtherealVWAPStrategy:
                         str(trail_info.get("prev_high")),
                         str(trail_info.get("prev_low")),
                         str(trail_info.get("prev_close")),
-                        str(trail_info.get("range")),
+                        str(trail_info.get("body")),
                         str(cur_sl),
                         str(trail_info.get("candidate_raw")),
                     )
@@ -1949,15 +1949,15 @@ class EtherealVWAPStrategy:
         # Determine candle sign
         out["candle_sign"] = "bull" if c > o else "bear"
 
-        rng = (h - l).copy_abs()
-        out["range"] = rng
-        if rng <= 0:
-            out["reason"] = "zero_range"
+        body = (c - o).copy_abs()
+        out["body"] = body
+        if body <= 0:
+            out["reason"] = "zero_body"
             return out
 
         # "all" mode: always tighten by abs body.
         if mode == "all":
-            cand = (current_sl + rng) if d == "LONG" else (current_sl - rng)
+            cand = (current_sl + body) if d == "LONG" else (current_sl - body)
             out["candidate_raw"] = cand
             out["eligible"] = True
             out["reason"] = "all_candles"
@@ -1969,7 +1969,7 @@ class EtherealVWAPStrategy:
             if c >= o:
                 out["reason"] = "not_bearish_for_long"
                 return out
-            cand = current_sl + rng
+            cand = current_sl + (o - c)
             out["candidate_raw"] = cand
             out["eligible"] = True
             return out
@@ -1978,7 +1978,7 @@ class EtherealVWAPStrategy:
         if c <= o:
             out["reason"] = "not_bullish_for_short"
             return out
-        cand = current_sl - rng
+        cand = current_sl - (c - o)
         out["candidate_raw"] = cand
         out["eligible"] = True
         return out
@@ -2371,7 +2371,7 @@ class EtherealVWAPStrategy:
                 except Exception:
                     trail = None
             self._trailing_debug(
-                "TRAIL DEBUG: vwap trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_o=%s prev_h=%s prev_l=%s prev_c=%s range=%s current_sl=%s candidate_raw=%s",
+                "TRAIL DEBUG: vwap trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_o=%s prev_h=%s prev_l=%s prev_c=%s body=%s current_sl=%s candidate_raw=%s",
                 self.cfg.ticker,
                 self.direction,
                 str(trail_info.get("eligible")),
@@ -2380,7 +2380,7 @@ class EtherealVWAPStrategy:
                 str(trail_info.get("prev_high")),
                 str(trail_info.get("prev_low")),
                 str(trail_info.get("prev_close")),
-                str(trail_info.get("range")),
+                str(trail_info.get("body")),
                 str(cur_sl),
                 str(trail_info.get("candidate_raw")),
             )
