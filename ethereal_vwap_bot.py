@@ -57,6 +57,11 @@ def _is_pos_finite_decimal(x: Decimal) -> bool:
         return False
 
 
+def _is_order_not_found_error(e: Exception) -> bool:
+    s = str(e) or ""
+    return ("404" in s and "Not Found" in s) or ("Order not found" in s)
+
+
 @dataclass(frozen=True)
 class StrategyConfig:
     # Strategy selection:
@@ -249,6 +254,8 @@ class EtherealVWAPStrategy:
         # Best-effort cached exit trigger levels (for trailing SL logic without extra API calls).
         self.state.setdefault("exit_levels", {"tp": None, "sl": None})  # strings (Decimals)
         self.state.setdefault("exit_group_id", None)
+        # When exits were last placed (ms since epoch), used to avoid reacting to transient 404s.
+        self.state.setdefault("exit_placed_ms", 0)
         self.state.setdefault("trading_paused", False)
         self.state.setdefault("pause_reason", None)
         self.state.setdefault("paused_at", None)
@@ -749,6 +756,7 @@ class EtherealVWAPStrategy:
         self.state["exit_orders"] = {"tp": None, "sl": None}
         self.state["exit_levels"] = {"tp": None, "sl": None}
         self.state["exit_group_id"] = None
+        self.state["exit_placed_ms"] = 0
 
     async def _confirm_order_status(self, order_id: str) -> Optional[str]:
         """Fetch order by id and return status (upper)."""
@@ -768,6 +776,10 @@ class EtherealVWAPStrategy:
             return
         eo = self.state.get("exit_orders") or {}
         ids = {"tp": eo.get("tp"), "sl": eo.get("sl")}
+        now_ms = _dt_to_ms(_utc_now())
+        placed_ms = int(self.state.get("exit_placed_ms") or 0)
+        too_soon = placed_ms and (now_ms - placed_ms) < 10_000
+        not_found = False
         changed = False
         for kind, oid in ids.items():
             if not oid or levels.get(kind):
@@ -785,10 +797,18 @@ class EtherealVWAPStrategy:
                 if _is_pos_finite_decimal(px):
                     levels[kind] = str(px)
                     changed = True
-            except Exception:
+            except Exception as e:
+                if _is_order_not_found_error(e):
+                    not_found = True
                 continue
         if changed:
             self.state["exit_levels"] = levels
+            self._save_state()
+        # If API reports exits are missing (404) and it's not immediately after placement,
+        # clear exit ids so the bot can recreate TP/SL and avoid staying unprotected.
+        if not_found and (not too_soon) and self.state.get("exit_order_ids"):
+            logger.warning("Exit orders not found in API; clearing cached exit ids to recreate TP/SL.")
+            await self._cancel_exits()
             self._save_state()
 
     @staticmethod
@@ -1063,6 +1083,7 @@ class EtherealVWAPStrategy:
             self.state["exit_orders"] = {"tp": tp_id, "sl": sl_id}
             self.state["exit_levels"] = {"tp": str(tp_px), "sl": str(sl_px)}
             self.state["exit_group_id"] = group_id
+            self.state["exit_placed_ms"] = _dt_to_ms(_utc_now())
             self._save_state()
             logger.info("EXITS placed (OCO): TP=%s SL=%s qty=%s group=%s", tp_px, sl_px, qty, group_id)
         except Exception as e:
