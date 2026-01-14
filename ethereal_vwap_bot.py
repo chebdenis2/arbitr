@@ -1908,17 +1908,32 @@ class EtherealVWAPStrategy:
         if src in {"state", "auto"}:
             try:
                 o0 = _as_decimal(self.state.get("prev_candle_open_price"))
-                h0 = _as_decimal(self.state.get("prev_candle_high_price"))
-                l0 = _as_decimal(self.state.get("prev_candle_low_price"))
                 c0 = _as_decimal(self.state.get("prev_candle_close_price"))
-                if _is_pos_finite_decimal(o0) and _is_pos_finite_decimal(h0) and _is_pos_finite_decimal(l0) and _is_pos_finite_decimal(c0):
-                    o, h, l, c = o0, h0, l0, c0
+                if _is_pos_finite_decimal(o0) and _is_pos_finite_decimal(c0):
+                    o, c = o0, c0
+                    # High/low are optional for body-based trailing; fill if present, else infer from O/C.
+                    try:
+                        h0 = _as_decimal(self.state.get("prev_candle_high_price"))
+                        if _is_pos_finite_decimal(h0):
+                            h = h0
+                    except Exception:
+                        pass
+                    try:
+                        l0 = _as_decimal(self.state.get("prev_candle_low_price"))
+                        if _is_pos_finite_decimal(l0):
+                            l = l0
+                    except Exception:
+                        pass
+                    if h is None:
+                        h = max(o, c)
+                    if l is None:
+                        l = min(o, c)
                     out["candle_source_used"] = "state"
             except Exception:
                 pass
 
         # 2) Fallback to Bybit klines if requested/needed
-        if (o is None or h is None or l is None or c is None) and src in {"bybit_klines", "auto"}:
+        if (o is None or c is None) and src in {"bybit_klines", "auto"}:
             # Prefer bybit fallback when vwap_source is bybit_klines (typical case).
             vsrc = (self.cfg.vwap_source or "").strip().lower()
             # If user wants candles from Ethereal market prices, don't silently switch to Bybit in auto mode.
@@ -1934,7 +1949,7 @@ class EtherealVWAPStrategy:
                         o, h, l, c = ohlc
                     out["candle_source_used"] = "bybit_klines"
 
-        if o is None or h is None or l is None or c is None:
+        if o is None or c is None:
             out["reason"] = "prev_candle_missing"
             return out
 
