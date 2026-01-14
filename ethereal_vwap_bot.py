@@ -2014,13 +2014,17 @@ class EtherealVWAPStrategy:
         vwap = await self._get_vwap(anchor_start_ms, now_ms)
         entry_px, tp_px, sl_px = self._levels(vwap)
 
-        # Persist last known oracle price snapshot for robust anchor transitions.
-        if (price == price) and price > 0:
+        # Reference price for candle tracking / post-only repricing:
+        # Prefer market price; if unavailable (0/NaN), fall back to VWAP (useful when vwap_source=bybit_klines).
+        ref_price = price if _is_pos_finite_decimal(price) else (vwap if _is_pos_finite_decimal(vwap) else Decimal("NaN"))
+
+        # Persist last known reference price snapshot for robust anchor transitions and repricing.
+        if _is_pos_finite_decimal(ref_price):
             prev_saved = self._price_from_state("last_price") or Decimal("0")
-            self.state["last_price"] = str(price)
+            self.state["last_price"] = str(ref_price)
             self.state["last_price_ms"] = int(now_ms)
             self.state["last_price_anchor_ms"] = int(anchor_start_ms)
-            if prev_saved <= 0 or (price - prev_saved).copy_abs() / price > Decimal("0.0005"):
+            if prev_saved <= 0 or (ref_price - prev_saved).copy_abs() / ref_price > Decimal("0.0005"):
                 self._save_state()
 
             # Update candle open/close tracking from reference price.
@@ -2029,15 +2033,17 @@ class EtherealVWAPStrategy:
                 self.state["candle_open_price"] = None
                 self.state["candle_close_price"] = None
             if self.state.get("candle_open_price") is None:
-                self.state["candle_open_price"] = str(price)
-            self.state["candle_close_price"] = str(price)
+                self.state["candle_open_price"] = str(ref_price)
+            self.state["candle_close_price"] = str(ref_price)
             self._trailing_debug(
-                "TRAIL DEBUG: candle_update ticker=%s candle_start=%s open=%s close=%s price=%s",
+                "TRAIL DEBUG: candle_update ticker=%s candle_start=%s open=%s close=%s ref_price=%s (market=%s vwap=%s)",
                 self.cfg.ticker,
                 _ms_to_dt(int(self.state.get("candle_start_ms") or 0)).isoformat(),
                 str(self.state.get("candle_open_price")),
                 str(self.state.get("candle_close_price")),
+                str(ref_price),
                 str(price),
+                str(vwap),
             )
 
         # Persist last known VWAP snapshot for anchor_open TP (works for any vwap_source).
@@ -2121,7 +2127,7 @@ class EtherealVWAPStrategy:
                 now_ms=now_ms,
                 anchor_start_ms=anchor_start_ms,
                 prev_anchor_ms=prev_anchor,
-                price=price,
+                price=ref_price,
                 vwap=vwap,
                 pos=pos,
                 has_pos=has_pos,
@@ -2173,7 +2179,7 @@ class EtherealVWAPStrategy:
                     str(sl_px),
                     str(self.cfg.vwap_source),
                 )
-            await self._ensure_entry_order(entry_px, ref_price=price)
+            await self._ensure_entry_order(entry_px, ref_price=ref_price)
             return
 
         # Position exists:
