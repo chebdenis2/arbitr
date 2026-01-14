@@ -98,6 +98,10 @@ class StrategyConfig:
     entry_distance_short_pct: Decimal = Decimal("1.5")  # % from VWAP for SHORT
     entry_quantity: Decimal = Decimal("0.001")  # base asset qty
     post_only: bool = True
+    # If post_only order is rejected as ImmediateMatchPostOnly, reprice away from market and retry.
+    post_only_reprice_on_reject: bool = True
+    post_only_reprice_max_attempts: int = 3
+    post_only_reprice_ticks: int = 2
     entry_expires_in_sec: int = 7 * 24 * 3600  # GTD expiry (seconds)
 
     # One exit "bracket" (OCO TP+SL)
@@ -915,7 +919,7 @@ class EtherealVWAPStrategy:
         cid = f"{self.client_prefix}{kind}{ts:09d}{rnd}"
         return cid[:32]
 
-    async def _ensure_entry_order(self, entry_px: Decimal) -> None:
+    async def _ensure_entry_order(self, entry_px: Decimal, *, ref_price: Optional[Decimal] = None) -> None:
         existing_oid = self.state.get("entry_order_id")
         if existing_oid:
             st = await self._confirm_order_status(str(existing_oid))
@@ -938,28 +942,51 @@ class EtherealVWAPStrategy:
             adopted = await self._adopt_existing_entry_if_any(side)
             if adopted:
                 return
-        cid = self._mk_client_order_id("E")
+        async def place(px: Decimal) -> Optional[tuple[str, str, str]]:
+            """Return (order_id, result, filled) or None."""
+            cid_local = self._mk_client_order_id("E")
+            try:
+                sender = getattr(getattr(self.client, "chain", None), "address", None)
+                expires_at = int(time.time()) + int(self.cfg.entry_expires_in_sec)
+                o = await self.client.create_order(
+                    order_type="LIMIT",
+                    product_id=self.product_id,
+                    ticker=self.cfg.ticker,
+                    side=side,
+                    quantity=float(qty),
+                    price=float(px),
+                    post_only=bool(self.cfg.post_only),
+                    time_in_force="GTD",
+                    expires_at=expires_at,
+                    client_order_id=cid_local,
+                    sender=sender,
+                    subaccount=self.subaccount_name,
+                )
+                oid_local = str(getattr(o, "id", "") or "")
+                result_local = self._result_value(getattr(o, "result", "") or "")
+                filled_local = str(getattr(o, "filled", "") or "")
+                # persist client id for this attempt only if accepted
+                if oid_local:
+                    self.state["entry_client_order_id"] = cid_local
+                return oid_local, result_local, filled_local
+            except Exception as e:
+                logger.error("Failed to place ENTRY: %r", e)
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    logger.error(
+                        "Got 401 Unauthorized. Check ETHEREAL_TESTNET/ETHEREAL_BASE_URL match, and that this key "
+                        "is allowed to trade on this subaccount. Linked signers are only needed if trading via a separate signer."
+                    )
+                return None
 
-        try:
-            sender = getattr(getattr(self.client, "chain", None), "address", None)
-            expires_at = int(time.time()) + int(self.cfg.entry_expires_in_sec)
-            o = await self.client.create_order(
-                order_type="LIMIT",
-                product_id=self.product_id,
-                ticker=self.cfg.ticker,
-                side=side,
-                quantity=float(qty),
-                price=float(entry_px),
-                post_only=bool(self.cfg.post_only),
-                time_in_force="GTD",
-                expires_at=expires_at,
-                client_order_id=cid,
-                sender=sender,
-                subaccount=self.subaccount_name,
-            )
-            oid = str(getattr(o, "id", "") or "")
-            result = self._result_value(getattr(o, "result", "") or "")
-            filled = str(getattr(o, "filled", "") or "")
+        # Post-only repricing retry on ImmediateMatchPostOnly
+        attempt = 0
+        px = self._round_price(entry_px)
+        while True:
+            attempt += 1
+            placed = await place(px)
+            if not placed:
+                return
+            oid, result, filled = placed
 
             # Important: API can return an id even when result != Ok (e.g. InsufficientBalance, PostOnly reject, etc.)
             if result and result.strip().lower() != "ok":
@@ -968,8 +995,42 @@ class EtherealVWAPStrategy:
                     result,
                     filled,
                     qty,
-                    entry_px,
+                    px,
                 )
+                if (
+                    bool(self.cfg.post_only)
+                    and bool(getattr(self.cfg, "post_only_reprice_on_reject", True))
+                    and str(result).strip().lower() == "immediatematchpostonly"
+                    and attempt < max(1, int(getattr(self.cfg, "post_only_reprice_max_attempts", 3) or 3))
+                ):
+                    # Reprice away from market using reference price (oracle/mark/index) if available.
+                    rp = ref_price
+                    if rp is None or not _is_pos_finite_decimal(rp):
+                        try:
+                            rp = _as_decimal(self.state.get("last_price") or "0")
+                        except Exception:
+                            rp = None
+                    ticks = max(1, int(getattr(self.cfg, "post_only_reprice_ticks", 2) or 2))
+                    off = (self.product_tick_size * Decimal(str(ticks))) if _is_pos_finite_decimal(self.product_tick_size) else Decimal("0")
+                    if rp is not None and _is_pos_finite_decimal(rp) and off > 0:
+                        if self.direction == "LONG":
+                            px2 = min(px, rp - off)
+                        else:
+                            px2 = max(px, rp + off)
+                        px2 = self._round_price(px2)
+                        if _is_pos_finite_decimal(px2) and px2 != px:
+                            logger.warning(
+                                "Post-only repricing after ImmediateMatchPostOnly: %s %s attempt=%s px=%s -> %s (ref=%s ticks=%s)",
+                                self.direction,
+                                self.cfg.ticker,
+                                attempt,
+                                str(px),
+                                str(px2),
+                                str(rp),
+                                ticks,
+                            )
+                            px = px2
+                            continue
                 return
             if not oid:
                 logger.error("ENTRY submit returned empty order id (result=%s)", result or "UNKNOWN")
@@ -987,9 +1048,8 @@ class EtherealVWAPStrategy:
                 return
 
             self.state["entry_order_id"] = oid
-            self.state["entry_client_order_id"] = cid
             # Pending entry (used for stats when a position becomes visible).
-            self.state["pending_entry_price"] = str(entry_px)
+            self.state["pending_entry_price"] = str(px)
             self.state["pending_entry_qty"] = str(qty)
             self.state["pending_entry_at"] = _utc_now().isoformat()
             self._save_state()
@@ -997,19 +1057,13 @@ class EtherealVWAPStrategy:
                 "ENTRY placed: %s qty=%s px=%s (order_id=%s status=%s result=%s filled=%s)",
                 self.direction,
                 qty,
-                entry_px,
+                px,
                 oid,
                 status or "UNKNOWN",
                 result or "UNKNOWN",
                 filled or "0",
             )
-        except Exception as e:
-            logger.error("Failed to place ENTRY: %r", e)
-            if "401" in str(e) or "Unauthorized" in str(e):
-                logger.error(
-                    "Got 401 Unauthorized. Check ETHEREAL_TESTNET/ETHEREAL_BASE_URL match, and that this key "
-                    "is allowed to trade on this subaccount. Linked signers are only needed if trading via a separate signer."
-                )
+            return
 
     async def _ensure_oco_exits(self, pos: dict, tp_px: Decimal, sl_px: Decimal, *, direction: Optional[str] = None) -> None:
         if self.state.get("exit_order_ids"):
@@ -2119,7 +2173,7 @@ class EtherealVWAPStrategy:
                     str(sl_px),
                     str(self.cfg.vwap_source),
                 )
-            await self._ensure_entry_order(entry_px)
+            await self._ensure_entry_order(entry_px, ref_price=price)
             return
 
         # Position exists:

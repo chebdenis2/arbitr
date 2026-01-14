@@ -86,6 +86,7 @@ Edit it to change:
 - `trailing_debug_logs` (true/false) — подробные логи по свечам/трейлингу (какие open/close видит бот и почему двигает/не двигает SL)
 - `entry_distance_long_pct` / `entry_distance_short_pct`
 - `entry_quantity`
+- `post_only_reprice_on_reject` / `post_only_reprice_max_attempts` / `post_only_reprice_ticks` — если post-only LIMIT отклонён как ImmediateMatchPostOnly, бот сдвигает цену на N тиков от референс-цены и пробует ещё раз
 - `entry_expires_in_sec` / `exit_expires_in_sec`
 - `tp_pct` / `sl_pct`
 - `anchor_period` (Session/Week/Month/Year/Hour/2 Hours/4 Hours/8 Hours/12 Hours)
