@@ -73,13 +73,14 @@ class StrategyConfig:
     deposit_usd: Decimal = Decimal("0")
 
     # Trailing stop (applies to both strategies when enabled):
-    # For each new candle, look at the previous candle body:
+    # For each new candle, look at the previous candle RANGE:
+    #   range = high - low
     # - If trailing_candle_filter == "opposite" (original rule):
     #   - LONG: act only if prev candle is bearish (close < open) => tighten SL by (open-close)
     #   - SHORT: act only if prev candle is bullish (close > open) => tighten SL by (close-open)
     # - If trailing_candle_filter == "all" (test mode):
-    #   - LONG: always tighten SL by abs(close-open)
-    #   - SHORT: always tighten SL by abs(close-open)
+    #   - LONG: always tighten SL by (high-low)
+    #   - SHORT: always tighten SL by (high-low)
     trailing_stop_enabled: bool = False
     trailing_candle_filter: str = "all"  # "all" | "opposite"
     # Where to take previous candle open/close for trailing:
@@ -311,9 +312,13 @@ class EtherealVWAPStrategy:
         # Candle tracking for trailing stop (prices use reference price from get_oracle_price()).
         self.state.setdefault("candle_open_price", None)  # str Decimal
         self.state.setdefault("candle_close_price", None)  # str Decimal
+        self.state.setdefault("candle_high_price", None)  # str Decimal
+        self.state.setdefault("candle_low_price", None)  # str Decimal
         self.state.setdefault("candle_start_ms", 0)
         self.state.setdefault("prev_candle_open_price", None)  # str Decimal
         self.state.setdefault("prev_candle_close_price", None)  # str Decimal
+        self.state.setdefault("prev_candle_high_price", None)  # str Decimal
+        self.state.setdefault("prev_candle_low_price", None)  # str Decimal
         self.state.setdefault("prev_candle_start_ms", 0)
         # Last known oracle price snapshot (for robust anchor transitions in anchor_open).
         self.state.setdefault("last_price", None)  # str Decimal
@@ -1521,14 +1526,16 @@ class EtherealVWAPStrategy:
                     # Compute trailing candidate; it is only produced for "opposite" candles by definition.
                     trail_info = await self._trailing_decision_async(trade_direction=d, current_sl=cur_sl)
                     self._trailing_debug(
-                        "TRAIL DEBUG: anchor_open trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_open=%s prev_close=%s body=%s current_sl=%s candidate_raw=%s",
+                        "TRAIL DEBUG: anchor_open trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_o=%s prev_h=%s prev_l=%s prev_c=%s range=%s current_sl=%s candidate_raw=%s",
                         self.cfg.ticker,
                         d,
                         str(trail_info.get("eligible")),
                         str(trail_info.get("reason")),
                         str(trail_info.get("prev_open")),
+                        str(trail_info.get("prev_high")),
+                        str(trail_info.get("prev_low")),
                         str(trail_info.get("prev_close")),
-                        str(trail_info.get("body")),
+                        str(trail_info.get("range")),
                         str(cur_sl),
                         str(trail_info.get("candidate_raw")),
                     )
@@ -1810,7 +1817,7 @@ class EtherealVWAPStrategy:
             return "D" if n == 1 else None
         return None
 
-    async def _bybit_prev_candle_open_close(self, prev_start_ms: int, tf_ms: int) -> Optional[tuple[Decimal, Decimal]]:
+    async def _bybit_prev_candle_ohlc(self, prev_start_ms: int, tf_ms: int) -> Optional[tuple[Decimal, Decimal, Decimal, Decimal]]:
         """
         Fetch previous candle open/close from Bybit kline API.
         Uses cfg.bybit_* settings.
@@ -1853,15 +1860,19 @@ class EtherealVWAPStrategy:
                     if int(it[0]) != start:
                         continue
                     o = _as_decimal(it[1])
+                    h = _as_decimal(it[2])
+                    l = _as_decimal(it[3])
                     cl = _as_decimal(it[4])
-                    if _is_pos_finite_decimal(o) and _is_pos_finite_decimal(cl):
-                        return o, cl
+                    if _is_pos_finite_decimal(o) and _is_pos_finite_decimal(h) and _is_pos_finite_decimal(l) and _is_pos_finite_decimal(cl):
+                        return o, h, l, cl
                 # Fallback to first row if exact match not found.
                 it = rows[0]
                 o = _as_decimal(it[1])
+                h = _as_decimal(it[2])
+                l = _as_decimal(it[3])
                 cl = _as_decimal(it[4])
-                if _is_pos_finite_decimal(o) and _is_pos_finite_decimal(cl):
-                    return o, cl
+                if _is_pos_finite_decimal(o) and _is_pos_finite_decimal(h) and _is_pos_finite_decimal(l) and _is_pos_finite_decimal(cl):
+                    return o, h, l, cl
         except Exception:
             return None
         return None
@@ -1892,20 +1903,24 @@ class EtherealVWAPStrategy:
             return out
 
         o: Optional[Decimal] = None
+        h: Optional[Decimal] = None
+        l: Optional[Decimal] = None
         c: Optional[Decimal] = None
         # 1) Try state candle first (unless forced bybit_klines)
         if src in {"state", "auto"}:
             try:
                 o0 = _as_decimal(self.state.get("prev_candle_open_price"))
+                h0 = _as_decimal(self.state.get("prev_candle_high_price"))
+                l0 = _as_decimal(self.state.get("prev_candle_low_price"))
                 c0 = _as_decimal(self.state.get("prev_candle_close_price"))
-                if _is_pos_finite_decimal(o0) and _is_pos_finite_decimal(c0):
-                    o, c = o0, c0
+                if _is_pos_finite_decimal(o0) and _is_pos_finite_decimal(h0) and _is_pos_finite_decimal(l0) and _is_pos_finite_decimal(c0):
+                    o, h, l, c = o0, h0, l0, c0
                     out["candle_source_used"] = "state"
             except Exception:
                 pass
 
         # 2) Fallback to Bybit klines if requested/needed
-        if (o is None or c is None) and src in {"bybit_klines", "auto"}:
+        if (o is None or h is None or l is None or c is None) and src in {"bybit_klines", "auto"}:
             # Prefer bybit fallback when vwap_source is bybit_klines (typical case).
             vsrc = (self.cfg.vwap_source or "").strip().lower()
             if src == "bybit_klines" or vsrc == "bybit_klines":
@@ -1913,16 +1928,18 @@ class EtherealVWAPStrategy:
                 cur_start_ms = int(self.state.get("last_candle_start_ms") or 0)
                 prev_start_ms = int(self.state.get("prev_candle_start_ms") or 0) or (cur_start_ms - tf_ms)
                 if prev_start_ms > 0 and tf_ms > 0:
-                    oc = await self._bybit_prev_candle_open_close(prev_start_ms, tf_ms)
-                    if oc is not None:
-                        o, c = oc
+                    ohlc = await self._bybit_prev_candle_ohlc(prev_start_ms, tf_ms)
+                    if ohlc is not None:
+                        o, h, l, c = ohlc
                     out["candle_source_used"] = "bybit_klines"
 
-        if o is None or c is None:
+        if o is None or h is None or l is None or c is None:
             out["reason"] = "prev_candle_missing"
             return out
 
         out["prev_open"] = o
+        out["prev_high"] = h
+        out["prev_low"] = l
         out["prev_close"] = c
         if o == c:
             out["reason"] = "doji"
@@ -1931,14 +1948,15 @@ class EtherealVWAPStrategy:
         # Determine candle sign
         out["candle_sign"] = "bull" if c > o else "bear"
 
+        rng = (h - l).copy_abs()
+        out["range"] = rng
+        if rng <= 0:
+            out["reason"] = "zero_range"
+            return out
+
         # "all" mode: always tighten by abs body.
         if mode == "all":
-            body = (c - o).copy_abs()
-            out["body"] = body
-            if body <= 0:
-                out["reason"] = "zero_body"
-                return out
-            cand = (current_sl + body) if d == "LONG" else (current_sl - body)
+            cand = (current_sl + rng) if d == "LONG" else (current_sl - rng)
             out["candidate_raw"] = cand
             out["eligible"] = True
             out["reason"] = "all_candles"
@@ -1950,9 +1968,7 @@ class EtherealVWAPStrategy:
             if c >= o:
                 out["reason"] = "not_bearish_for_long"
                 return out
-            body = o - c
-            out["body"] = body
-            cand = current_sl + body
+            cand = current_sl + rng
             out["candidate_raw"] = cand
             out["eligible"] = True
             return out
@@ -1961,9 +1977,7 @@ class EtherealVWAPStrategy:
         if c <= o:
             out["reason"] = "not_bullish_for_short"
             return out
-        body = c - o
-        out["body"] = body
-        cand = current_sl - body
+        cand = current_sl - rng
         out["candidate_raw"] = cand
         out["eligible"] = True
         return out
@@ -2105,10 +2119,14 @@ class EtherealVWAPStrategy:
             # Finalize previous candle tracking (for trailing stop)
             self.state["prev_candle_open_price"] = self.state.get("candle_open_price")
             self.state["prev_candle_close_price"] = self.state.get("candle_close_price")
+            self.state["prev_candle_high_price"] = self.state.get("candle_high_price")
+            self.state["prev_candle_low_price"] = self.state.get("candle_low_price")
             self.state["prev_candle_start_ms"] = int(self.state.get("candle_start_ms") or 0)
             # Reset current candle
             self.state["candle_open_price"] = None
             self.state["candle_close_price"] = None
+            self.state["candle_high_price"] = None
+            self.state["candle_low_price"] = None
             self.state["candle_start_ms"] = int(candle_start_ms)
 
             self.state["last_candle_start_ms"] = candle_start_ms
@@ -2144,14 +2162,33 @@ class EtherealVWAPStrategy:
                 self.state["candle_start_ms"] = int(candle_start_ms)
                 self.state["candle_open_price"] = None
                 self.state["candle_close_price"] = None
+                self.state["candle_high_price"] = None
+                self.state["candle_low_price"] = None
             if self.state.get("candle_open_price") is None:
                 self.state["candle_open_price"] = str(ref_price)
+                self.state["candle_high_price"] = str(ref_price)
+                self.state["candle_low_price"] = str(ref_price)
             self.state["candle_close_price"] = str(ref_price)
+            # Update high/low
+            try:
+                hi = _as_decimal(self.state.get("candle_high_price"))
+            except Exception:
+                hi = ref_price
+            try:
+                lo = _as_decimal(self.state.get("candle_low_price"))
+            except Exception:
+                lo = ref_price
+            if _is_pos_finite_decimal(hi) and ref_price > hi:
+                self.state["candle_high_price"] = str(ref_price)
+            if _is_pos_finite_decimal(lo) and ref_price < lo:
+                self.state["candle_low_price"] = str(ref_price)
             self._trailing_debug(
-                "TRAIL DEBUG: candle_update ticker=%s candle_start=%s open=%s close=%s ref_price=%s (market=%s vwap=%s)",
+                "TRAIL DEBUG: candle_update ticker=%s candle_start=%s o=%s h=%s l=%s c=%s ref=%s (market=%s vwap=%s)",
                 self.cfg.ticker,
                 _ms_to_dt(int(self.state.get("candle_start_ms") or 0)).isoformat(),
                 str(self.state.get("candle_open_price")),
+                str(self.state.get("candle_high_price")),
+                str(self.state.get("candle_low_price")),
                 str(self.state.get("candle_close_price")),
                 str(ref_price),
                 str(price),
@@ -2351,14 +2388,16 @@ class EtherealVWAPStrategy:
                 except Exception:
                     trail = None
             self._trailing_debug(
-                "TRAIL DEBUG: vwap trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_open=%s prev_close=%s body=%s current_sl=%s candidate_raw=%s",
+                "TRAIL DEBUG: vwap trailing decision ticker=%s dir=%s eligible=%s reason=%s prev_o=%s prev_h=%s prev_l=%s prev_c=%s range=%s current_sl=%s candidate_raw=%s",
                 self.cfg.ticker,
                 self.direction,
                 str(trail_info.get("eligible")),
                 str(trail_info.get("reason")),
                 str(trail_info.get("prev_open")),
+                str(trail_info.get("prev_high")),
+                str(trail_info.get("prev_low")),
                 str(trail_info.get("prev_close")),
-                str(trail_info.get("body")),
+                str(trail_info.get("range")),
                 str(cur_sl),
                 str(trail_info.get("candidate_raw")),
             )
