@@ -80,6 +80,10 @@ class StrategyConfig:
     #   - SHORT: always tighten SL by (high-low)
     trailing_stop_enabled: bool = False
     trailing_candle_filter: str = "all"  # "all" | "opposite"
+    # Which price stream to build candles for trailing stop:
+    # - "market": use Ethereal market/oracle/mark/index/last price (recommended)
+    # - "ref": use ref_price (may fall back to VWAP when market price is unavailable)
+    trailing_candle_price_source: str = "market"
     # Where to take previous candle open/close for trailing:
     # - "state": use candle tracking from ref_price sampling (default)
     # - "bybit_klines": fetch previous candle OHLC from Bybit (more reliable when vwap_source=bybit_klines)
@@ -1811,7 +1815,10 @@ class EtherealVWAPStrategy:
         if (o is None or h is None or l is None or c is None) and src in {"bybit_klines", "auto"}:
             # Prefer bybit fallback when vwap_source is bybit_klines (typical case).
             vsrc = (self.cfg.vwap_source or "").strip().lower()
-            if src == "bybit_klines" or vsrc == "bybit_klines":
+            # If user wants candles from Ethereal market prices, don't silently switch to Bybit in auto mode.
+            candle_price_src = str(getattr(self.cfg, "trailing_candle_price_source", "market") or "market").strip().lower()
+            allow_auto_bybit = not (src == "auto" and candle_price_src == "market")
+            if src == "bybit_klines" or (vsrc == "bybit_klines" and allow_auto_bybit):
                 tf_ms = self._timeframe_ms(self.cfg.timeframe)
                 cur_start_ms = int(self.state.get("last_candle_start_ms") or 0)
                 prev_start_ms = int(self.state.get("prev_candle_start_ms") or 0) or (cur_start_ms - tf_ms)
@@ -2032,9 +2039,15 @@ class EtherealVWAPStrategy:
         vwap = await self._get_vwap(anchor_start_ms, now_ms)
         entry_px, tp_px, sl_px = self._levels(vwap)
 
-        # Reference price for candle tracking / post-only repricing:
+        # Reference price for post-only repricing and (optionally) candle tracking:
         # Prefer market price; if unavailable (0/NaN), fall back to VWAP (useful when vwap_source=bybit_klines).
         ref_price = price if _is_pos_finite_decimal(price) else (vwap if _is_pos_finite_decimal(vwap) else Decimal("NaN"))
+
+        # Candle price source (for trailing candles):
+        candle_price_src = str(getattr(self.cfg, "trailing_candle_price_source", "market") or "market").strip().lower()
+        if candle_price_src not in {"market", "ref"}:
+            candle_price_src = "market"
+        candle_price = price if candle_price_src == "market" else ref_price
 
         # Persist last known reference price snapshot for robust anchor transitions and repricing.
         if _is_pos_finite_decimal(ref_price):
@@ -2045,7 +2058,8 @@ class EtherealVWAPStrategy:
             if prev_saved <= 0 or (ref_price - prev_saved).copy_abs() / ref_price > Decimal("0.0005"):
                 self._save_state()
 
-            # Update candle open/close tracking from reference price.
+        # Update candle open/high/low/close tracking from selected candle price.
+        if _is_pos_finite_decimal(candle_price):
             if int(self.state.get("candle_start_ms") or 0) != int(candle_start_ms):
                 self.state["candle_start_ms"] = int(candle_start_ms)
                 self.state["candle_open_price"] = None
@@ -2053,23 +2067,23 @@ class EtherealVWAPStrategy:
                 self.state["candle_high_price"] = None
                 self.state["candle_low_price"] = None
             if self.state.get("candle_open_price") is None:
-                self.state["candle_open_price"] = str(ref_price)
-                self.state["candle_high_price"] = str(ref_price)
-                self.state["candle_low_price"] = str(ref_price)
-            self.state["candle_close_price"] = str(ref_price)
+                self.state["candle_open_price"] = str(candle_price)
+                self.state["candle_high_price"] = str(candle_price)
+                self.state["candle_low_price"] = str(candle_price)
+            self.state["candle_close_price"] = str(candle_price)
             # Update high/low
             try:
                 hi = _as_decimal(self.state.get("candle_high_price"))
             except Exception:
-                hi = ref_price
+                hi = candle_price
             try:
                 lo = _as_decimal(self.state.get("candle_low_price"))
             except Exception:
-                lo = ref_price
-            if _is_pos_finite_decimal(hi) and ref_price > hi:
-                self.state["candle_high_price"] = str(ref_price)
-            if _is_pos_finite_decimal(lo) and ref_price < lo:
-                self.state["candle_low_price"] = str(ref_price)
+                lo = candle_price
+            if _is_pos_finite_decimal(hi) and candle_price > hi:
+                self.state["candle_high_price"] = str(candle_price)
+            if _is_pos_finite_decimal(lo) and candle_price < lo:
+                self.state["candle_low_price"] = str(candle_price)
             self._trailing_debug(
                 "TRAIL DEBUG: candle_update ticker=%s candle_start=%s o=%s h=%s l=%s c=%s ref=%s (market=%s vwap=%s)",
                 self.cfg.ticker,
@@ -2078,7 +2092,7 @@ class EtherealVWAPStrategy:
                 str(self.state.get("candle_high_price")),
                 str(self.state.get("candle_low_price")),
                 str(self.state.get("candle_close_price")),
-                str(ref_price),
+                str(candle_price),
                 str(price),
                 str(vwap),
             )
@@ -2342,6 +2356,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 strategy=str(raw.get("strategy", "vwap")),
                 trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
                 trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
+                trailing_candle_price_source=str(raw.get("trailing_candle_price_source", "market")),
                 trailing_prev_candle_source=str(raw.get("trailing_prev_candle_source", "auto")),
                 ticker=str(raw.get("ticker", "SOLUSD")),
                 direction=str(raw.get("direction", "LONG")).upper(),
@@ -2384,6 +2399,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "strategy": cfg.strategy,
                 "trailing_stop_enabled": cfg.trailing_stop_enabled,
                 "trailing_candle_filter": cfg.trailing_candle_filter,
+                "trailing_candle_price_source": cfg.trailing_candle_price_source,
                 "trailing_prev_candle_source": cfg.trailing_prev_candle_source,
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
@@ -2438,6 +2454,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         strategy=str(raw.get("strategy", "vwap")),
         trailing_stop_enabled=bool(raw.get("trailing_stop_enabled", False)),
         trailing_candle_filter=str(raw.get("trailing_candle_filter", "all")),
+        trailing_candle_price_source=str(raw.get("trailing_candle_price_source", "market")),
         trailing_prev_candle_source=str(raw.get("trailing_prev_candle_source", "auto")),
         ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
         direction=str(raw.get("direction", "LONG")).strip().upper(),
@@ -2477,6 +2494,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "strategy": str(getattr(cfg, "strategy", "vwap")),
         "trailing_stop_enabled": bool(getattr(cfg, "trailing_stop_enabled", False)),
         "trailing_candle_filter": str(getattr(cfg, "trailing_candle_filter", "all")),
+        "trailing_candle_price_source": str(getattr(cfg, "trailing_candle_price_source", "market")),
         "trailing_prev_candle_source": str(getattr(cfg, "trailing_prev_candle_source", "auto")),
         "ticker": cfg.ticker,
         "direction": cfg.direction,

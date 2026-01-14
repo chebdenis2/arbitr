@@ -82,6 +82,7 @@ Edit it to change:
 - `strategy` — `"vwap"` (по умолчанию) или `"anchor_open"` (вход на новом анкере маркетом)
 - `trailing_stop_enabled` (true/false) — трейлинг‑стоп по диапазону предыдущей свечи (High-Low) (для обеих стратегий)
 - `trailing_candle_filter` — `"all"` (тест: трейлинг по диапазону любой свечи) или `"opposite"` (старое поведение: только свечи против позиции)
+- `trailing_candle_price_source` — `"market"` (свечи строятся по ценам Ethereal) или `"ref"` (свечи по ref_price, может падать на VWAP)
 - `trailing_prev_candle_source` — `"state"` (свечи из ref_price), `"bybit_klines"` (OHLC с Bybit), `"auto"` (state → fallback на Bybit, если нет данных)
 - `trailing_debug_logs` (true/false) — подробные логи по свечам/трейлингу (какие open/close видит бот и почему двигает/не двигает SL)
 - `entry_distance_long_pct` / `entry_distance_short_pct`
