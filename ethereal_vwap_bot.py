@@ -2769,6 +2769,24 @@ def _parse_csv_upper(s: str) -> list[str]:
     return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
 
 
+async def _retry_on_connect_error(name: str, coro_factory, *, base_delay: float = 1.0, max_delay: float = 30.0) -> Any:
+    """
+    Retry network calls on transient connect errors.
+    coro_factory: zero-arg callable that returns an awaitable.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await coro_factory()
+        except Exception as e:
+            if not _is_connect_error(e):
+                raise
+            attempt += 1
+            delay = min(max_delay, base_delay * (2 ** min(attempt, 6)))
+            logger.warning("Network error during %s (attempt=%s). Retrying in %.1fs.", name, attempt, delay)
+            await asyncio.sleep(delay)
+
+
 def _strategy_config_from_json(raw: dict) -> StrategyConfig:
     trades_page_limit = int(raw.get("trades_page_limit", 200))
     trades_page_limit = min(max(trades_page_limit, 1), 200)  # clamp to API max
@@ -2940,7 +2958,7 @@ async def amain() -> None:
             sub_idx = int(os.getenv("ETHEREAL_SUBACCOUNT_INDEX", str(sub_idx_from_file)))
 
             # Shared discovery to reduce API calls for multi-run.
-            subs = await client.subaccounts()
+            subs = await _retry_on_connect_error("subaccounts()", lambda: client.subaccounts())
             if not subs:
                 raise RuntimeError(
                     "No subaccounts found for this key. On Ethereal, a subaccount is created only after you "
@@ -2952,13 +2970,16 @@ async def amain() -> None:
             sub_id = subs[sub_idx].id
             sub_name = subs[sub_idx].name
 
-            products = await client.products_by_ticker()
+            products = await _retry_on_connect_error("products_by_ticker()", lambda: client.products_by_ticker())
 
             strategies: list[EtherealVWAPStrategy] = []
             for i, cfg in enumerate(cfgs):
                 s = EtherealVWAPStrategy(client, cfg, subaccount_index=sub_idx)
                 try:
-                    await s.initialize(subaccount_id=sub_id, subaccount_name=sub_name, products_by_ticker=products)
+                    await _retry_on_connect_error(
+                        f"initialize({cfg.ticker})",
+                        lambda: s.initialize(subaccount_id=sub_id, subaccount_name=sub_name, products_by_ticker=products),
+                    )
                 except RuntimeError as e:
                     logger.error("[%s %s] %s", cfg.direction, cfg.ticker, str(e))
                     continue
@@ -2988,7 +3009,7 @@ async def amain() -> None:
         sub_idx = int(os.getenv("ETHEREAL_SUBACCOUNT_INDEX", "0"))
         strat = EtherealVWAPStrategy(client, cfg, subaccount_index=sub_idx)
         try:
-            await strat.initialize()
+            await _retry_on_connect_error("initialize(single)", lambda: strat.initialize())
         except RuntimeError as e:
             logger.error(str(e))
             return
