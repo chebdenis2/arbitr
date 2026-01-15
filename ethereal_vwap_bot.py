@@ -3179,6 +3179,27 @@ async def amain() -> None:
             if not cfgs:
                 raise RuntimeError(f"{MULTI_CONFIG_FILE} has no strategies. Add at least 1 strategy and re-run.")
 
+            # Safety: this bot is NOT hedge-mode. Running multiple strategies on the same ticker in the same
+            # subaccount will cause exit/position management conflicts and can stall trading (stale exits, cancels, etc.).
+            by_ticker: dict[str, list[StrategyConfig]] = {}
+            for c in cfgs:
+                t = (c.ticker or "").strip().upper()
+                if not t:
+                    continue
+                by_ticker.setdefault(t, []).append(c)
+            dup = {t: lst for t, lst in by_ticker.items() if len(lst) > 1}
+            if dup:
+                details = "; ".join(
+                    f"{t}=" + ",".join(f"{(x.strategy or 'vwap')}:{(x.direction or '').upper()}" for x in lst)
+                    for t, lst in sorted(dup.items())
+                )
+                raise RuntimeError(
+                    "Invalid multi config: multiple strategies for the same ticker in one subaccount. "
+                    "This bot supports only ONE strategy per ticker per subaccount. "
+                    "Use separate subaccounts if you need LONG+SHORT simultaneously. "
+                    f"Duplicates: {details}"
+                )
+
             # Optional global override for multi-mode.
             # We keep it explicit to avoid unintentionally overwriting per-instrument config.
             if os.getenv("ETHEREAL_ENTRY_QTY") and _truthy_env("ETHEREAL_ENTRY_QTY_ALL"):
