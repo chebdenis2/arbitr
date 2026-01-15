@@ -2587,8 +2587,9 @@ class EtherealVWAPStrategy:
                 await self.step()
             except KeyboardInterrupt:
                 raise
-            except Exception as e:
-                logger.error("Loop error: %s", e)
+            except Exception:
+                # Some exceptions (e.g., AssertionError) have empty str(e); keep full traceback.
+                logger.exception("Loop error in %s %s", self.direction, self.cfg.ticker)
             await asyncio.sleep(int(self.cfg.poll_interval_sec))
 
 
