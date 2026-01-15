@@ -130,6 +130,9 @@ class StrategyConfig:
     # New pause model (recommended): pause trading for N minutes after SL.
     # If 0 -> disabled (unless pause_on_sl=true, which enables a default pause as backward compatibility).
     pause_after_sl_minutes: int = 0
+    # Optional: do not trigger pause immediately on startup due to historical stop fills.
+    # If true, the bot will mark all reduce-only stop fills up to startup time as "already handled".
+    pause_skip_on_startup: bool = False
 
     # ---------------------------
     # Strategy: anchor_open
@@ -169,6 +172,7 @@ class EtherealVWAPStrategy:
     def __init__(self, client: AsyncRESTClient, cfg: StrategyConfig, subaccount_index: int = 0):
         self.client = client
         self.cfg = cfg
+        self.started_at_ms = _dt_to_ms(_utc_now())
 
         d = (cfg.direction or "LONG").strip().upper()
         if d in {"L", "LONG"}:
@@ -197,6 +201,25 @@ class EtherealVWAPStrategy:
 
         self.state: Dict[str, Any] = {}
         self._load_state()
+
+        # Optional: skip pause-on-startup caused by historical reduce-only stop fills.
+        # We do it by moving last_handled_reduce_stop_ts forward to startup time.
+        if bool(getattr(self.cfg, "pause_skip_on_startup", False)):
+            try:
+                last_ts = int(self.state.get("last_handled_reduce_stop_ts") or 0)
+            except Exception:
+                last_ts = 0
+            if last_ts < int(self.started_at_ms):
+                self.state["startup_ms"] = int(self.started_at_ms)
+                self.state["last_handled_reduce_stop_ts"] = int(self.started_at_ms)
+                self.state["last_handled_reduce_stop_order_id"] = str(self.state.get("last_handled_reduce_stop_order_id") or "startup")
+                self._save_state()
+                logger.info(
+                    "Startup pause-skip enabled: ticker=%s strategy=%s last_handled_reduce_stop_ts=%s",
+                    self.cfg.ticker,
+                    self._cfg_strategy(),
+                    int(self.started_at_ms),
+                )
 
     async def initialize(
         self,
@@ -300,6 +323,8 @@ class EtherealVWAPStrategy:
         # Robust close detection via recent FILLED reduce-only stop orders (for pause-after-SL).
         self.state.setdefault("last_handled_reduce_stop_order_id", None)
         self.state.setdefault("last_handled_reduce_stop_ts", 0)  # ms
+        # Process startup time (ms) for optional pause-skip behavior.
+        self.state.setdefault("startup_ms", 0)
         # Throttle repeated network error logs.
         self.state.setdefault("last_connect_error_log_ms", 0)
         # Throttle unknown-close diagnostics.
@@ -3227,6 +3252,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
                 pause_on_sl=bool(raw.get("pause_on_sl", False)),
                 pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
+                pause_skip_on_startup=bool(raw.get("pause_skip_on_startup", False)),
                 anchor_open_min_delta_pct=_as_decimal(raw.get("anchor_open_min_delta_pct", raw.get("anchor_open_min_vwap_delta_pct", "0"))),
                 anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
                 anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
@@ -3270,6 +3296,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "exit_expires_in_sec": cfg.exit_expires_in_sec,
                 "pause_on_sl": cfg.pause_on_sl,
                 "pause_after_sl_minutes": cfg.pause_after_sl_minutes,
+                "pause_skip_on_startup": bool(getattr(cfg, "pause_skip_on_startup", False)),
                 "anchor_open_min_delta_pct": str(cfg.anchor_open_min_delta_pct),
                 "anchor_open_sl_pct_of_tp": str(cfg.anchor_open_sl_pct_of_tp),
                 "anchor_open_close_on_anchor_end": cfg.anchor_open_close_on_anchor_end,
@@ -3343,6 +3370,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         exit_expires_in_sec=int(raw.get("exit_expires_in_sec", 7 * 24 * 3600)),
         pause_on_sl=bool(raw.get("pause_on_sl", False)),
         pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
+        pause_skip_on_startup=bool(raw.get("pause_skip_on_startup", False)),
         anchor_open_min_delta_pct=_as_decimal(raw.get("anchor_open_min_delta_pct", raw.get("anchor_open_min_vwap_delta_pct", "0"))),
         anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
         anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
@@ -3383,6 +3411,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "exit_expires_in_sec": cfg.exit_expires_in_sec,
         "pause_on_sl": cfg.pause_on_sl,
         "pause_after_sl_minutes": int(getattr(cfg, "pause_after_sl_minutes", 0) or 0),
+        "pause_skip_on_startup": bool(getattr(cfg, "pause_skip_on_startup", False)),
         "anchor_open_min_delta_pct": str(getattr(cfg, "anchor_open_min_delta_pct", Decimal("0"))),
         "anchor_open_sl_pct_of_tp": str(getattr(cfg, "anchor_open_sl_pct_of_tp", Decimal("100"))),
         "anchor_open_close_on_anchor_end": bool(getattr(cfg, "anchor_open_close_on_anchor_end", True)),
