@@ -293,6 +293,8 @@ class EtherealVWAPStrategy:
         self.state.setdefault("recent_trade_ids", [])
         # For robust position transition detection.
         self.state.setdefault("last_position_size", "0")
+        # How many consecutive step() calls saw no open position (used for safe stale-exit cleanup).
+        self.state.setdefault("no_position_streak", 0)
         self.state.setdefault("last_close_reason", None)
         self.state.setdefault("last_close_at", None)
         # Robust close detection via recent FILLED reduce-only stop orders (for pause-after-SL).
@@ -300,6 +302,8 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_handled_reduce_stop_ts", 0)  # ms
         # Throttle repeated network error logs.
         self.state.setdefault("last_connect_error_log_ms", 0)
+        # Throttle unknown-close diagnostics.
+        self.state.setdefault("pause_diag_last_log_ms", 0)
 
     def _log_network_warning(self, where: str, e: Exception) -> None:
         now_ms = _dt_to_ms(_utc_now())
@@ -788,6 +792,18 @@ class EtherealVWAPStrategy:
         ids = list(self.state.get("exit_order_ids") or [])
         if ids:
             await self._cancel_order_ids(ids)
+        self.state["exit_order_ids"] = []
+        self.state["exit_orders"] = {"tp": None, "sl": None}
+        self.state["exit_levels"] = {"tp": None, "sl": None}
+        self.state["exit_group_id"] = None
+        self.state["exit_placed_ms"] = 0
+        self.state["exit_qty"] = None
+
+    def _clear_exit_state_local(self) -> None:
+        """
+        Clear exit-related state without calling cancel_orders().
+        Used to recover from cases where position is confirmed closed but stale exit ids block new entries.
+        """
         self.state["exit_order_ids"] = []
         self.state["exit_orders"] = {"tp": None, "sl": None}
         self.state["exit_levels"] = {"tp": None, "sl": None}
@@ -1964,6 +1980,31 @@ class EtherealVWAPStrategy:
                         str(self.state.get("exit_group_id") or ""),
                         str(int(self.state.get("exit_placed_ms") or 0)),
                     )
+                # Recovery: if position stays absent for a few consecutive polls, clear exits state
+                # so stale exit ids don't block new entries indefinitely.
+                try:
+                    streak = int(self.state.get("no_position_streak") or 0)
+                except Exception:
+                    streak = 0
+                if streak >= 2 and exit_ids:
+                    statuses: list[Optional[str]] = []
+                    for oid in exit_ids:
+                        try:
+                            statuses.append(await self._confirm_order_status(str(oid)))
+                        except Exception:
+                            statuses.append(None)
+                    # Only act if we could confirm at least one status (avoid acting on pure network issues).
+                    if statuses and any(s is not None for s in statuses):
+                        confirmed = [s for s in statuses if s is not None]
+                        if confirmed and all(self._is_terminal_status(s) for s in confirmed):
+                            logger.warning(
+                                "Clearing stale exit state after close (reason unknown): ticker=%s streak=%s statuses=%s",
+                                self.cfg.ticker,
+                                streak,
+                                ",".join(str(s) for s in statuses),
+                            )
+                            self._clear_exit_state_local()
+                            self._save_state()
         return False
 
     def _cfg_strategy(self) -> str:
@@ -2945,6 +2986,16 @@ class EtherealVWAPStrategy:
         # Persist last position size to detect transitions reliably.
         prev_size = _as_decimal(self.state.get("last_position_size") or "0").copy_abs()
         self.state["last_position_size"] = str(pos_size)
+        # Track consecutive "no position" observations to avoid acting on transient position API glitches.
+        try:
+            streak = int(self.state.get("no_position_streak") or 0)
+        except Exception:
+            streak = 0
+        if has_pos:
+            streak = 0
+        else:
+            streak = min(10_000, streak + 1)
+        self.state["no_position_streak"] = int(streak)
         # NOTE: we save state only on meaningful events to avoid excessive writes.
 
         # Common close detection (all strategies): if position isn't visible, detect SL/TP and apply pause.
