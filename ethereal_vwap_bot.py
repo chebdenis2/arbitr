@@ -1814,7 +1814,7 @@ class EtherealVWAPStrategy:
 
                     # Round trailing candidate to tick size before applying.
                     trail_r = self._round_price(trail)
-                    new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=trail_r)
+                    new_sl = self._tightened_sl(current_sl=cur_sl, desired_sl=trail_r, trade_direction=d)
 
                     # Use cached TP (prefer exit_levels, fallback anchor_open_tp_price).
                     tp = self._decimal_from_state("anchor_open_tp_price") or self._decimal_from_state("prev_anchor_vwap")
@@ -1994,7 +1994,13 @@ class EtherealVWAPStrategy:
             return 60
         return 0
 
-    def _tightened_sl(self, *, current_sl: Optional[Decimal], desired_sl: Decimal) -> Decimal:
+    def _tightened_sl(
+        self,
+        *,
+        current_sl: Optional[Decimal],
+        desired_sl: Decimal,
+        trade_direction: Optional[str] = None,
+    ) -> Decimal:
         """
         VWAP strategy rule: after entry, SL can only tighten (reduce risk).
         - LONG: SL price can only move up (increase numerically).
@@ -2004,7 +2010,10 @@ class EtherealVWAPStrategy:
             return desired_sl
         if not _is_pos_finite_decimal(desired_sl):
             return current_sl
-        if self.direction == "LONG":
+        d = (trade_direction or self.direction or "").strip().upper()
+        if d not in {"LONG", "SHORT"}:
+            d = (self.direction or "").strip().upper()
+        if d == "LONG":
             return desired_sl if desired_sl > current_sl else current_sl
         # SHORT
         return desired_sl if desired_sl < current_sl else current_sl
