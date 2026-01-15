@@ -1205,21 +1205,26 @@ class EtherealVWAPStrategy:
         if not exit_ids:
             return None
         try:
-            filled: dict[str, tuple[str, Any]] = {}
+            filled: list[tuple[str, Any]] = []
             for oid in exit_ids:
-                o = await self.client.get_order(id=UUID(str(oid)))
+                try:
+                    o = await self.client.get_order(id=UUID(str(oid)))
+                except Exception as e:
+                    # One leg of OCO can disappear/cancel quickly; don't fail the whole detection.
+                    if _is_order_not_found_error(e):
+                        continue
+                    raise
                 status = (getattr(o, "status", "") or "").upper()
-                st_obj = getattr(o, "stop_type", None)
-                filled[oid] = (status, st_obj)
-            for oid, (st, st_obj) in filled.items():
-                if st != "FILLED":
+                if status != "FILLED":
                     continue
-                eo = self.state.get("exit_orders") or {}
-                if oid == eo.get("sl"):
-                    return "SL"
-                if oid == eo.get("tp"):
-                    return "TP"
-                # If state mapping is missing, infer from stop_type (0=TP, 1=SL).
+                st_obj = getattr(o, "stop_type", None)
+                filled.append((str(oid), st_obj))
+
+            if not filled:
+                return None
+
+            # Prefer stop_type over state mapping (state can drift after restarts / 404s).
+            for _, st_obj in filled:
                 try:
                     stv = getattr(st_obj, "value", st_obj)
                     stv_int = int(stv)
@@ -1229,9 +1234,14 @@ class EtherealVWAPStrategy:
                     return "SL"
                 if stv_int == 0:
                     return "TP"
-                # fallback if we can't infer
-                return "TP"
-            return None
+            # If we can't infer from stop_type, fallback to state mapping.
+            eo = self.state.get("exit_orders") or {}
+            for oid, _ in filled:
+                if oid == eo.get("sl"):
+                    return "SL"
+                if oid == eo.get("tp"):
+                    return "TP"
+            return "TP"
         except Exception:
             return None
 
@@ -1306,6 +1316,12 @@ class EtherealVWAPStrategy:
             return False
 
         reason = await self._detect_close_reason(exit_ids)
+        if not reason:
+            # Fallback: handle cases where OCO legs become 404 or state mapping drifted.
+            try:
+                reason = await self._detect_close_reason_from_recent_orders()
+            except Exception:
+                reason = None
         if not reason:
             # If both exits are no longer working (stale ids), clear them to avoid blocking entries forever.
             try:
