@@ -62,6 +62,14 @@ def _is_order_not_found_error(e: Exception) -> bool:
     return ("404" in s and "Not Found" in s) or ("Order not found" in s)
 
 
+def _is_connect_error(e: Exception) -> bool:
+    # SDK requests use httpx/httpcore; be robust to both.
+    if isinstance(e, httpx.ConnectError):
+        return True
+    name = type(e).__name__
+    return "ConnectError" in name or "NetworkError" in name or "ReadTimeout" in name or "Timeout" in name
+
+
 @dataclass(frozen=True)
 class StrategyConfig:
     # Strategy selection:
@@ -287,6 +295,8 @@ class EtherealVWAPStrategy:
         # Robust close detection via recent FILLED reduce-only stop orders (for pause-after-SL).
         self.state.setdefault("last_handled_reduce_stop_order_id", None)
         self.state.setdefault("last_handled_reduce_stop_ts", 0)  # ms
+        # Throttle repeated network error logs.
+        self.state.setdefault("last_connect_error_log_ms", 0)
 
         # Candle tracking for trailing stop (prices use reference price from get_oracle_price()).
         self.state.setdefault("candle_open_price", None)  # str Decimal
@@ -626,32 +636,47 @@ class EtherealVWAPStrategy:
     # ---------------------------
     async def get_oracle_price(self) -> Decimal:
         assert self.product_id is not None
-        prices = await self.client.list_market_prices(product_ids=[str(self.product_id)])
-        if not prices:
-            return Decimal("NaN")
-        p = prices[0]
-        # Not all instruments have oraclePrice populated. Fallback to other common fields.
-        # We still return a "reference price" used for anchor_open open-price capture.
-        for k in (
-            "oraclePrice",
-            "oracle_price",
-            "markPrice",
-            "mark_price",
-            "indexPrice",
-            "index_price",
-            "midPrice",
-            "mid_price",
-            "lastPrice",
-            "last_price",
-            "price",
-        ):
+        # Retry on transient network errors.
+        for attempt in range(3):
             try:
-                v = _as_decimal(getattr(p, k, None) or "0")
-            except Exception:
-                continue
-            if _is_pos_finite_decimal(v):
-                return v
-        # Keep NaN here (caller decides what to do).
+                prices = await self.client.list_market_prices(product_ids=[str(self.product_id)])
+                if not prices:
+                    return Decimal("NaN")
+                p = prices[0]
+                # Not all instruments have oraclePrice populated. Fallback to other common fields.
+                # We still return a "reference price" used for anchor_open open-price capture.
+                for k in (
+                    "oraclePrice",
+                    "oracle_price",
+                    "markPrice",
+                    "mark_price",
+                    "indexPrice",
+                    "index_price",
+                    "midPrice",
+                    "mid_price",
+                    "lastPrice",
+                    "last_price",
+                    "price",
+                ):
+                    try:
+                        v = _as_decimal(getattr(p, k, None) or "0")
+                    except Exception:
+                        continue
+                    if _is_pos_finite_decimal(v):
+                        return v
+                return Decimal("NaN")
+            except Exception as e:
+                if not _is_connect_error(e):
+                    raise
+                await asyncio.sleep(0.5 * (2**attempt))
+
+        # If we still can't fetch, fall back to last known reference price in state.
+        try:
+            last = _as_decimal(self.state.get("last_price") or "0")
+        except Exception:
+            last = Decimal("NaN")
+        if _is_pos_finite_decimal(last):
+            return last
         return Decimal("NaN")
 
     def _round_price(self, px: Decimal) -> Decimal:
@@ -2264,8 +2289,33 @@ class EtherealVWAPStrategy:
                 str(self.state.get("prev_candle_close_price")),
             )
 
-        price = await self.get_oracle_price()
-        vwap = await self._get_vwap(anchor_start_ms, now_ms)
+        # Network errors can happen; keep trading loop alive.
+        try:
+            price = await self.get_oracle_price()
+        except Exception as e:
+            if _is_connect_error(e):
+                now_ms_local = _dt_to_ms(_utc_now())
+                last_log = int(self.state.get("last_connect_error_log_ms") or 0)
+                if not last_log or (now_ms_local - last_log) > 30_000:
+                    self.state["last_connect_error_log_ms"] = now_ms_local
+                    self._save_state()
+                    logger.warning("Network error fetching price (%s %s): %s", self.direction, self.cfg.ticker, type(e).__name__)
+                price = Decimal("NaN")
+            else:
+                raise
+        try:
+            vwap = await self._get_vwap(anchor_start_ms, now_ms)
+        except Exception as e:
+            if _is_connect_error(e):
+                now_ms_local = _dt_to_ms(_utc_now())
+                last_log = int(self.state.get("last_connect_error_log_ms") or 0)
+                if not last_log or (now_ms_local - last_log) > 30_000:
+                    self.state["last_connect_error_log_ms"] = now_ms_local
+                    self._save_state()
+                    logger.warning("Network error fetching vwap (%s %s): %s", self.direction, self.cfg.ticker, type(e).__name__)
+                vwap = Decimal("NaN")
+            else:
+                raise
         entry_px, tp_px, sl_px = self._levels(vwap)
 
         # Reference price for post-only repricing and (optionally) candle tracking:
