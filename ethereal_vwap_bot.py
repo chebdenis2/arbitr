@@ -272,6 +272,9 @@ class EtherealVWAPStrategy:
         self.state.setdefault("exit_qty", None)  # str Decimal
         self.state.setdefault("trading_paused", False)
         self.state.setdefault("pause_reason", None)
+        self.state.setdefault("pause_source", None)
+        self.state.setdefault("pause_strategy", None)
+        self.state.setdefault("pause_trade_direction", None)
         self.state.setdefault("paused_at", None)
         # Pause timer (new model): pause_until_ts is a unix timestamp (seconds).
         self.state.setdefault("pause_until_ts", 0)
@@ -1639,6 +1642,10 @@ class EtherealVWAPStrategy:
         self.state["last_close_reason"] = reason
         self.state["last_close_at"] = _utc_now().isoformat()
 
+        # Capture context for pause logs before we potentially clear anchor_open state.
+        pause_td = str(self.state.get("anchor_open_direction") or self.direction or "LONG").strip().upper()
+        pause_strategy = self._cfg_strategy()
+
         # If anchor_open strategy trade was active, mark it closed.
         if self.state.get("anchor_open_active"):
             self._clear_anchor_open_state(reason=reason)
@@ -1648,7 +1655,16 @@ class EtherealVWAPStrategy:
             pause_min = self._pause_after_sl_minutes()
             if pause_min > 0:
                 await self._cancel_entry()
-                self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source="exit_fill")
+                self._set_pause_after_sl(
+                    pause_min,
+                    vwap=vwap,
+                    entry_px=entry_px,
+                    tp_px=tp_px,
+                    sl_px=sl_px,
+                    source="exit_fill",
+                    trade_direction=pause_td,
+                    strategy=pause_strategy,
+                )
                 return True
 
         self._save_state()
@@ -1694,6 +1710,9 @@ class EtherealVWAPStrategy:
 
         # If we have a recent reduce-only stop fill (for our group/placed window), treat as a close event.
         if recent_reason in {"SL", "TP"}:
+            # Capture context before clearing anchor state
+            pause_td = str(self.state.get("anchor_open_direction") or self.direction or "LONG").strip().upper()
+            pause_strategy = self._cfg_strategy()
             if recent_oid and recent_ts:
                 self.state["last_handled_reduce_stop_order_id"] = recent_oid
                 self.state["last_handled_reduce_stop_ts"] = int(recent_ts)
@@ -1715,6 +1734,8 @@ class EtherealVWAPStrategy:
                         tp_px=tp_px,
                         sl_px=sl_px,
                         source=f"recent_stop_order:{recent_oid or ''}".strip(":"),
+                        trade_direction=pause_td,
+                        strategy=pause_strategy,
                     )
                     return True
             return False
@@ -1722,6 +1743,8 @@ class EtherealVWAPStrategy:
         # If position likely closed (transition) and we have exit context, try to infer close reason.
         if closed_transition and has_exit_ctx:
             reason = None
+            pause_td = str(self.state.get("anchor_open_direction") or self.direction or "LONG").strip().upper()
+            pause_strategy = self._cfg_strategy()
             try:
                 reason = await self._detect_close_reason(exit_ids) if exit_ids else None
             except Exception:
@@ -1742,7 +1765,16 @@ class EtherealVWAPStrategy:
                 if reason == "SL":
                     pause_min = self._pause_after_sl_minutes()
                     if pause_min > 0:
-                        self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source="position_close")
+                        self._set_pause_after_sl(
+                            pause_min,
+                            vwap=vwap,
+                            entry_px=entry_px,
+                            tp_px=tp_px,
+                            sl_px=sl_px,
+                            source="position_close",
+                            trade_direction=pause_td,
+                            strategy=pause_strategy,
+                        )
                         return True
         return False
 
@@ -2448,6 +2480,8 @@ class EtherealVWAPStrategy:
         tp_px: Decimal,
         sl_px: Decimal,
         source: str,
+        trade_direction: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> None:
         minutes = max(0, int(minutes))
         if minutes <= 0:
@@ -2455,9 +2489,16 @@ class EtherealVWAPStrategy:
         now = _utc_now()
         now_ts = int(now.timestamp())
         until_ts = now_ts + minutes * 60
+        sname = (strategy or self._cfg_strategy() or "").strip().lower() or "vwap"
+        td = (trade_direction or self.state.get("anchor_open_direction") or self.direction or "").strip().upper()
+        if td not in {"LONG", "SHORT"}:
+            td = (self.direction or "LONG").strip().upper()
 
         self.state["trading_paused"] = True
         self.state["pause_reason"] = "SL_TIMER"
+        self.state["pause_source"] = str(source or "")
+        self.state["pause_strategy"] = sname
+        self.state["pause_trade_direction"] = td
         self.state["paused_at"] = now.isoformat()
         self.state["pause_until_ts"] = int(until_ts)
         self.state["pause_duration_min"] = int(minutes)
@@ -2467,12 +2508,13 @@ class EtherealVWAPStrategy:
         self._save_state()
 
         logger.warning(
-            "PAUSED after SL (%s): %s %s for %s min until %s. vwap=%s entry=%s tp=%s sl=%s",
-            source,
-            self.direction,
+            "PAUSED after SL: ticker=%s strategy=%s dir=%s minutes=%s until=%s source=%s vwap=%s entry=%s tp=%s sl=%s",
             self.cfg.ticker,
+            sname,
+            td,
             minutes,
             _ms_to_dt(until_ts * 1000).isoformat(),
+            str(source or ""),
             str(vwap),
             str(entry_px),
             str(tp_px),
@@ -2499,13 +2541,20 @@ class EtherealVWAPStrategy:
         until_ts = int(self.state.get("pause_until_ts") or 0)
         now_ts = int(now_ms / 1000)
         remaining = max(0, until_ts - now_ts) if until_ts > 0 else 0
+        src = str(self.state.get("pause_source") or "")
+        strat = str(self.state.get("pause_strategy") or self._cfg_strategy() or "")
+        td = str(self.state.get("pause_trade_direction") or self.direction or "")
+        paused_at = str(self.state.get("paused_at") or "")
         logger.info(
-            "PAUSED: %s %s reason=%s remaining=%ss until=%s",
-            self.direction,
+            "PAUSED: ticker=%s strategy=%s dir=%s remaining=%ss until=%s source=%s paused_at=%s reason=%s",
             self.cfg.ticker,
-            str(self.state.get("pause_reason") or ""),
+            strat,
+            td,
             int(remaining),
             (_ms_to_dt(until_ts * 1000).isoformat() if until_ts > 0 else "unknown"),
+            src,
+            paused_at,
+            str(self.state.get("pause_reason") or ""),
         )
 
     async def step(self) -> None:
@@ -2569,7 +2618,21 @@ class EtherealVWAPStrategy:
 
             self.state["last_candle_start_ms"] = candle_start_ms
             self._save_state()
-            logger.info("NEW CANDLE %s — full refresh", _ms_to_dt(candle_start_ms).isoformat())
+            if self.state.get("trading_paused"):
+                until_ts = int(self.state.get("pause_until_ts") or 0)
+                now_ts = int(now.timestamp())
+                remaining = max(0, until_ts - now_ts) if until_ts > 0 else 0
+                logger.info(
+                    "NEW CANDLE %s — PAUSED ticker=%s strategy=%s dir=%s remaining=%ss until=%s",
+                    _ms_to_dt(candle_start_ms).isoformat(),
+                    self.cfg.ticker,
+                    str(self.state.get("pause_strategy") or self._cfg_strategy() or ""),
+                    str(self.state.get("pause_trade_direction") or self.direction or ""),
+                    int(remaining),
+                    (_ms_to_dt(until_ts * 1000).isoformat() if until_ts > 0 else "unknown"),
+                )
+            else:
+                logger.info("NEW CANDLE %s — full refresh", _ms_to_dt(candle_start_ms).isoformat())
             self._trailing_debug(
                 "TRAIL DEBUG: new_candle_start=%s prev_candle_start=%s prev_open=%s prev_close=%s",
                 _ms_to_dt(candle_start_ms).isoformat(),
