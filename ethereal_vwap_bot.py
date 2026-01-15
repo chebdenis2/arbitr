@@ -70,6 +70,27 @@ def _is_connect_error(e: Exception) -> bool:
     return "ConnectError" in name or "NetworkError" in name or "ReadTimeout" in name or "Timeout" in name
 
 
+def _norm_status(x: Any) -> str:
+    """
+    Normalize status values coming from SDK/enums to a plain uppercase token.
+    Examples:
+      - Status.canceled -> CANCELED
+      - STATUS.NEW -> NEW
+      - "filled" -> FILLED
+    """
+    try:
+        v = getattr(x, "value", x)
+        s = str(v or "").strip()
+        if not s:
+            return ""
+        # Common SDK enum stringification: "Status.filled", "STATUS.NEW"
+        if "." in s:
+            s = s.split(".")[-1]
+        return s.strip().upper()
+    except Exception:
+        return ""
+
+
 @dataclass(frozen=True)
 class StrategyConfig:
     # Strategy selection:
@@ -840,7 +861,9 @@ class EtherealVWAPStrategy:
         """Fetch order by id and return status (upper)."""
         try:
             o = await self.client.get_order(id=UUID(order_id))
-            return str(getattr(o, "status", "") or "").upper()
+            st = getattr(o, "status", "")
+            out = _norm_status(st)
+            return out or None
         except Exception as e:
             if _is_connect_error(e):
                 self._log_network_warning("get_order(status)", e)
