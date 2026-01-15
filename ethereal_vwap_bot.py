@@ -298,6 +298,15 @@ class EtherealVWAPStrategy:
         # Throttle repeated network error logs.
         self.state.setdefault("last_connect_error_log_ms", 0)
 
+    def _log_network_warning(self, where: str, e: Exception) -> None:
+        now_ms = _dt_to_ms(_utc_now())
+        last_log = int(self.state.get("last_connect_error_log_ms") or 0)
+        if last_log and (now_ms - last_log) < 30_000:
+            return
+        self.state["last_connect_error_log_ms"] = now_ms
+        self._save_state()
+        logger.warning("Network error in %s (%s %s): %s", where, self.direction, self.cfg.ticker, type(e).__name__)
+
         # Candle tracking for trailing stop (prices use reference price from get_oracle_price()).
         self.state.setdefault("candle_open_price", None)  # str Decimal
         self.state.setdefault("candle_close_price", None)  # str Decimal
@@ -737,11 +746,17 @@ class EtherealVWAPStrategy:
     # ---------------------------
     async def _get_open_position(self) -> Optional[dict]:
         assert self.subaccount_id is not None and self.product_id is not None
-        positions = await self.client.list_positions(
-            subaccount_id=str(self.subaccount_id),
-            product_ids=[str(self.product_id)],
-            open=True,
-        )
+        try:
+            positions = await self.client.list_positions(
+                subaccount_id=str(self.subaccount_id),
+                product_ids=[str(self.product_id)],
+                open=True,
+            )
+        except Exception as e:
+            if _is_connect_error(e):
+                self._log_network_warning("list_positions", e)
+                return None
+            raise
         if not positions:
             return None
         # pick the latest updated one
@@ -782,7 +797,9 @@ class EtherealVWAPStrategy:
         try:
             o = await self.client.get_order(id=UUID(order_id))
             return (getattr(o, "status", "") or "").upper()
-        except Exception:
+        except Exception as e:
+            if _is_connect_error(e):
+                self._log_network_warning("get_order(status)", e)
             return None
 
     async def _hydrate_exit_levels_from_api(self) -> None:
@@ -817,6 +834,9 @@ class EtherealVWAPStrategy:
                     levels[kind] = str(px)
                     changed = True
             except Exception as e:
+                if _is_connect_error(e):
+                    self._log_network_warning("get_order(exit_levels)", e)
+                    continue
                 if _is_order_not_found_error(e):
                     not_found = True
                 continue
@@ -1291,7 +1311,10 @@ class EtherealVWAPStrategy:
                 order="desc",
                 order_by="createdAt",
             )
-        except Exception:
+        except Exception as e:
+            if _is_connect_error(e):
+                self._log_network_warning("list_orders(recent_reduce_stop)", e)
+                return None
             return None
         if not orders:
             return None
