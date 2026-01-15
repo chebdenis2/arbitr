@@ -843,6 +843,16 @@ class EtherealVWAPStrategy:
             st = ""
         if cls._is_filled_status(st):
             return True
+        # Some APIs expose filledAt even if status isn't normalized.
+        for k in ("filledAt", "filled_at"):
+            try:
+                v = getattr(o, k, None)
+                if v is None:
+                    continue
+                if cls._to_ms_ts(v) > 0:
+                    return True
+            except Exception:
+                continue
         try:
             fq = cls._filled_qty_from_order(o)
             return _is_pos_finite_decimal(fq) and fq > 0
@@ -1397,19 +1407,30 @@ class EtherealVWAPStrategy:
         """
         if not self.subaccount_id or not self.product_id:
             return None
+        orders = None
         try:
             orders = await self.client.list_orders(
                 subaccount_id=str(self.subaccount_id),
                 product_ids=[str(self.product_id)],
-                limit=100,
+                limit=200,
                 order="desc",
-                order_by="createdAt",
+                order_by="updatedAt",
             )
         except Exception as e:
             if _is_connect_error(e):
                 self._log_network_warning("list_orders(recent_reduce_stop)", e)
                 return None
-            return None
+        if orders is None:
+            try:
+                orders = await self.client.list_orders(
+                    subaccount_id=str(self.subaccount_id),
+                    product_ids=[str(self.product_id)],
+                    limit=200,
+                    order="desc",
+                    order_by="createdAt",
+                )
+            except Exception:
+                return None
         if not orders:
             return None
 
@@ -1423,7 +1444,12 @@ class EtherealVWAPStrategy:
                 og = str(getattr(o, "group_id", "") or getattr(o, "groupId", "") or "")
                 if want_group and og and og != want_group:
                     continue
-                reduce_only = bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False))
+                reduce_only = bool(
+                    getattr(o, "reduce_only", False)
+                    or getattr(o, "reduceOnly", False)
+                    or getattr(o, "close", False)
+                    or getattr(o, "isClose", False)
+                )
                 if not reduce_only:
                     continue
                 st = getattr(o, "stop_type", None)
@@ -1538,16 +1564,28 @@ class EtherealVWAPStrategy:
         want_group = str(self.state.get("exit_group_id") or "")
         placed_ms = int(self.state.get("exit_placed_ms") or 0)
 
+        orders = None
         try:
             orders = await self.client.list_orders(
                 subaccount_id=str(self.subaccount_id),
                 product_ids=[str(self.product_id)],
-                limit=100,
+                limit=200,
                 order="desc",
-                order_by="createdAt",
+                order_by="updatedAt",
             )
         except Exception:
-            return None
+            orders = None
+        if orders is None:
+            try:
+                orders = await self.client.list_orders(
+                    subaccount_id=str(self.subaccount_id),
+                    product_ids=[str(self.product_id)],
+                    limit=200,
+                    order="desc",
+                    order_by="createdAt",
+                )
+            except Exception:
+                return None
         if not orders:
             return None
 
@@ -1557,7 +1595,12 @@ class EtherealVWAPStrategy:
                 status = (getattr(o, "status", "") or "").upper()
                 if not self._order_is_filled(o):
                     continue
-                reduce_only = bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False))
+                reduce_only = bool(
+                    getattr(o, "reduce_only", False)
+                    or getattr(o, "reduceOnly", False)
+                    or getattr(o, "close", False)
+                    or getattr(o, "isClose", False)
+                )
                 if not reduce_only:
                     continue
                 # If we have an OCO group id, prefer matching it to avoid false positives.
@@ -1776,6 +1819,24 @@ class EtherealVWAPStrategy:
                             strategy=pause_strategy,
                         )
                         return True
+            else:
+                # Diagnostic (throttled): we saw a close transition but couldn't infer SL/TP.
+                now_ms = _dt_to_ms(_utc_now())
+                last_ms = int(self.state.get("pause_diag_last_log_ms") or 0)
+                if not last_ms or (now_ms - last_ms) >= 60_000:
+                    self.state["pause_diag_last_log_ms"] = int(now_ms)
+                    self._save_state()
+                    logger.warning(
+                        "CLOSE detected but reason unknown: ticker=%s strategy=%s dir=%s prev_pos=%s now_pos=%s exit_ids=%s group=%s placed_ms=%s",
+                        self.cfg.ticker,
+                        pause_strategy,
+                        pause_td,
+                        str(prev_pos_size),
+                        str(pos_size),
+                        ",".join(str(x) for x in exit_ids) if exit_ids else "",
+                        str(self.state.get("exit_group_id") or ""),
+                        str(int(self.state.get("exit_placed_ms") or 0)),
+                    )
         return False
 
     def _cfg_strategy(self) -> str:
