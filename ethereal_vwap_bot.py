@@ -2923,15 +2923,18 @@ async def amain() -> None:
     if not private_key:
         raise RuntimeError("Set ETHEREAL_PRIVATE_KEY (EVM private key) in env.")
 
-    client = await AsyncRESTClient.create(
-        {
-            "network": network,
-            "base_url": base_url,
-            "chain_config": {
-                "rpc_url": rpc_url,
-                "private_key": private_key,
-            },
-        }
+    client = await _retry_on_connect_error(
+        "AsyncRESTClient.create()",
+        lambda: AsyncRESTClient.create(
+            {
+                "network": network,
+                "base_url": base_url,
+                "chain_config": {
+                    "rpc_url": rpc_url,
+                    "private_key": private_key,
+                },
+            }
+        ),
     )
     try:
         use_multi = os.path.exists(MULTI_CONFIG_FILE) or _truthy_env("ETHEREAL_MULTI") or bool(os.getenv("ETHEREAL_TICKERS"))
