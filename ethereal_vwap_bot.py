@@ -802,6 +802,50 @@ class EtherealVWAPStrategy:
                 self._log_network_warning("get_order(status)", e)
             return None
 
+    @staticmethod
+    def _filled_qty_from_order(o: Any) -> Decimal:
+        """
+        Best-effort filled quantity extraction.
+        Ethereal SDK tends to expose `filled`, but tolerate alternative attribute names.
+        """
+        for k in ("filled", "filledQty", "filled_qty", "filledQuantity", "filled_quantity", "executed", "executedQty"):
+            try:
+                v = getattr(o, k, None)
+                if v is None:
+                    continue
+                d = _as_decimal(v)
+                if _is_pos_finite_decimal(d):
+                    return d
+            except Exception:
+                continue
+        return Decimal("0")
+
+    @staticmethod
+    def _is_filled_status(status: str) -> bool:
+        """
+        Status normalization for "filled" in Ethereal API responses.
+        We treat several terminal statuses as filled because SDKs/exchanges sometimes differ.
+        """
+        s = (status or "").strip().upper()
+        return s in {"FILLED", "CLOSED", "EXECUTED", "DONE", "SUCCESS"}
+
+    @classmethod
+    def _order_is_filled(cls, o: Any) -> bool:
+        """
+        Consider order filled if status says so, or if filled quantity is > 0.
+        """
+        try:
+            st = (getattr(o, "status", "") or "").strip().upper()
+        except Exception:
+            st = ""
+        if cls._is_filled_status(st):
+            return True
+        try:
+            fq = cls._filled_qty_from_order(o)
+            return _is_pos_finite_decimal(fq) and fq > 0
+        except Exception:
+            return False
+
     async def _exit_orders_working(self) -> bool:
         """
         Best-effort check whether recorded exit orders still exist and are working/filled.
@@ -822,7 +866,7 @@ class EtherealVWAPStrategy:
             if st is None:
                 # Unknown (network/propagation). Treat as present to avoid thrashing.
                 return True
-            if st.upper() == "FILLED":
+            if self._is_filled_status(st):
                 return True
             if st.upper() in {"NEW", "PENDING", "FILLED_PARTIAL"}:
                 return True
@@ -908,7 +952,8 @@ class EtherealVWAPStrategy:
     def _is_terminal_status(status: Optional[str]) -> bool:
         if not status:
             return False
-        return status.upper() in {"CANCELED", "EXPIRED", "REJECTED", "FILLED"}
+        s = status.upper()
+        return s in {"CANCELED", "EXPIRED", "REJECTED", "FILLED", "CLOSED", "EXECUTED", "DONE", "SUCCESS"}
 
     async def _adopt_existing_entry_if_any(self, side: int) -> bool:
         """If there is already a working entry LIMIT for this product+side, adopt it into state."""
@@ -1313,7 +1358,7 @@ class EtherealVWAPStrategy:
                         continue
                     raise
                 status = (getattr(o, "status", "") or "").upper()
-                if status != "FILLED":
+                if not self._order_is_filled(o):
                     continue
                 st_obj = getattr(o, "stop_type", None)
                 filled.append((str(oid), st_obj))
@@ -1369,7 +1414,7 @@ class EtherealVWAPStrategy:
         for o in orders:
             try:
                 status = (getattr(o, "status", "") or "").upper()
-                if status != "FILLED":
+                if not self._order_is_filled(o):
                     continue
                 # match group if we have it (preferred)
                 og = str(getattr(o, "group_id", "") or getattr(o, "groupId", "") or "")
@@ -1487,6 +1532,8 @@ class EtherealVWAPStrategy:
             return None
         last_ts = int(self.state.get("last_handled_reduce_stop_ts") or 0)
         last_id = str(self.state.get("last_handled_reduce_stop_order_id") or "")
+        want_group = str(self.state.get("exit_group_id") or "")
+        placed_ms = int(self.state.get("exit_placed_ms") or 0)
 
         try:
             orders = await self.client.list_orders(
@@ -1505,10 +1552,14 @@ class EtherealVWAPStrategy:
         for o in orders:
             try:
                 status = (getattr(o, "status", "") or "").upper()
-                if status != "FILLED":
+                if not self._order_is_filled(o):
                     continue
                 reduce_only = bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False))
                 if not reduce_only:
+                    continue
+                # If we have an OCO group id, prefer matching it to avoid false positives.
+                og = str(getattr(o, "group_id", "") or getattr(o, "groupId", "") or "")
+                if want_group and og and og != want_group:
                     continue
                 st = getattr(o, "stop_type", None)
                 stv_int = self._stop_type_int(st)
@@ -1518,6 +1569,9 @@ class EtherealVWAPStrategy:
                 oid = str(getattr(o, "id", "") or "")
                 ts = self._order_ts_ms(o)
                 if not oid or ts <= 0:
+                    continue
+                # If we know when exits were placed, ignore fills that predate it (avoid old historical order match).
+                if placed_ms and ts < (placed_ms - 60_000):
                     continue
                 # Dedup: ignore already handled
                 if oid == last_id:
@@ -1561,6 +1615,14 @@ class EtherealVWAPStrategy:
             except Exception:
                 reason = None
         if not reason:
+            # Last resort: recent reduce-only stop scan (filtered by group/placed_ms inside).
+            try:
+                recent = await self._detect_recent_reduce_only_stop_fill()
+                if recent:
+                    reason = str(recent[0] or "")
+            except Exception:
+                reason = None
+        if not reason:
             # If both exits are no longer working (stale ids), clear them to avoid blocking entries forever.
             try:
                 statuses = [await self._confirm_order_status(str(oid)) for oid in exit_ids]
@@ -1598,6 +1660,90 @@ class EtherealVWAPStrategy:
             str(tp_px),
             str(sl_px),
         )
+        return False
+
+    async def _handle_no_position_close_and_pause(
+        self,
+        *,
+        prev_pos_size: Decimal,
+        pos_size: Decimal,
+        vwap: Decimal,
+        entry_px: Decimal,
+        tp_px: Decimal,
+        sl_px: Decimal,
+    ) -> bool:
+        """
+        Common (all strategies) close detection when position is not visible.
+        Goal: reliably detect SL/TP, set pause on SL, and clear stale exit state without risking unprotecting a live position.
+        Returns True if caller should stop further actions this step.
+        """
+        # If we have neither a close transition nor any exit context, do nothing.
+        exit_ids = list(self.state.get("exit_order_ids") or [])
+        has_exit_ctx = bool(exit_ids or (self.state.get("exit_group_id") or "") or int(self.state.get("exit_placed_ms") or 0))
+        closed_transition = _is_pos_finite_decimal(prev_pos_size) and prev_pos_size > 0 and (not _is_pos_finite_decimal(pos_size) or pos_size <= 0)
+
+        recent_reason: Optional[str] = None
+        recent_oid: Optional[str] = None
+        recent_ts: Optional[int] = None
+        try:
+            recent = await self._detect_recent_reduce_only_stop_fill()
+            if recent:
+                recent_reason, recent_oid, recent_ts = str(recent[0]), str(recent[1]), int(recent[2])
+        except Exception:
+            recent_reason = None
+
+        # If we have a recent reduce-only stop fill (for our group/placed window), treat as a close event.
+        if recent_reason in {"SL", "TP"}:
+            if recent_oid and recent_ts:
+                self.state["last_handled_reduce_stop_order_id"] = recent_oid
+                self.state["last_handled_reduce_stop_ts"] = int(recent_ts)
+                self.state["last_close_reason"] = recent_reason
+                self.state["last_close_at"] = _ms_to_dt(int(recent_ts)).isoformat()
+            # Clear exits/entry and pause if needed.
+            await self._cancel_exits()
+            await self._cancel_entry()
+            if self.state.get("anchor_open_active"):
+                self._clear_anchor_open_state(reason=recent_reason)
+            self._save_state()
+            if recent_reason == "SL":
+                pause_min = self._pause_after_sl_minutes()
+                if pause_min > 0:
+                    self._set_pause_after_sl(
+                        pause_min,
+                        vwap=vwap,
+                        entry_px=entry_px,
+                        tp_px=tp_px,
+                        sl_px=sl_px,
+                        source=f"recent_stop_order:{recent_oid or ''}".strip(":"),
+                    )
+                    return True
+            return False
+
+        # If position likely closed (transition) and we have exit context, try to infer close reason.
+        if closed_transition and has_exit_ctx:
+            reason = None
+            try:
+                reason = await self._detect_close_reason(exit_ids) if exit_ids else None
+            except Exception:
+                reason = None
+            if reason is None:
+                try:
+                    reason = await self._detect_close_reason_from_recent_orders()
+                except Exception:
+                    reason = None
+            if reason:
+                await self._cancel_exits()
+                await self._cancel_entry()
+                self.state["last_close_reason"] = reason
+                self.state["last_close_at"] = _utc_now().isoformat()
+                if self.state.get("anchor_open_active"):
+                    self._clear_anchor_open_state(reason=reason)
+                self._save_state()
+                if reason == "SL":
+                    pause_min = self._pause_after_sl_minutes()
+                    if pause_min > 0:
+                        self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source="position_close")
+                        return True
         return False
 
     def _cfg_strategy(self) -> str:
@@ -2550,6 +2696,19 @@ class EtherealVWAPStrategy:
         self.state["last_position_size"] = str(pos_size)
         # NOTE: we save state only on meaningful events to avoid excessive writes.
 
+        # Common close detection (all strategies): if position isn't visible, detect SL/TP and apply pause.
+        if not has_pos:
+            handled_close = await self._handle_no_position_close_and_pause(
+                prev_pos_size=prev_size,
+                pos_size=pos_size,
+                vwap=vwap,
+                entry_px=entry_px,
+                tp_px=tp_px,
+                sl_px=sl_px,
+            )
+            if handled_close:
+                return
+
         # Handle pause-after-SL (timer model)
         if self.state.get("trading_paused"):
             now_ts = int(now.timestamp())
@@ -2584,53 +2743,6 @@ class EtherealVWAPStrategy:
             return
 
         if not has_pos:
-            # Robust close detection (API scan): catches SL/TP even when OCO ids are missing/404 or position closes between polls.
-            recent = await self._detect_recent_reduce_only_stop_fill()
-            if recent:
-                reason, oid, ts = recent
-                # Mark handled immediately to avoid repeated triggers
-                self.state["last_handled_reduce_stop_order_id"] = oid
-                self.state["last_handled_reduce_stop_ts"] = int(ts)
-                self.state["last_close_reason"] = reason
-                self.state["last_close_at"] = _ms_to_dt(int(ts)).isoformat()
-                self._save_state()
-
-                if reason == "SL":
-                    pause_min = self._pause_after_sl_minutes()
-                    if pause_min > 0:
-                        await self._cancel_entry()
-                        # Use current computed vwap/levels for logging; if NaN it's still ok.
-                        self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source=f"recent_stop_order:{oid}")
-                        return
-
-            # Detect position close transition (prev>0 -> now==0) and decide pause reason.
-            closed_now = prev_size > 0 and pos_size <= 0
-
-            # If position is closed, clean exits and possibly set pause on SL
-            exit_ids = list(self.state.get("exit_order_ids") or [])
-            reason: Optional[str] = None
-            if closed_now:
-                # Prefer explicit exit ids; fallback to recent filled stop orders.
-                reason = await self._detect_close_reason(exit_ids) if exit_ids else None
-                if reason is None:
-                    reason = await self._detect_close_reason_from_recent_orders()
-
-            if exit_ids:
-                await self._cancel_exits()
-
-            if closed_now and reason:
-                self.state["last_close_reason"] = reason
-                self.state["last_close_at"] = _utc_now().isoformat()
-                self._save_state()
-
-            if closed_now and reason == "SL":
-                pause_min = self._pause_after_sl_minutes()
-                if pause_min > 0:
-                    # Cancel any working entry too; we don't want orders while paused.
-                    await self._cancel_entry()
-                    self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source="position_close")
-                    return
-
             # If we still have active exits recorded, do not place new entries (position visibility can lag).
             if self.state.get("exit_order_ids"):
                 return
