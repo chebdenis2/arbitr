@@ -1323,11 +1323,7 @@ class EtherealVWAPStrategy:
 
             # Prefer stop_type over state mapping (state can drift after restarts / 404s).
             for _, st_obj in filled:
-                try:
-                    stv = getattr(st_obj, "value", st_obj)
-                    stv_int = int(stv)
-                except Exception:
-                    stv_int = None
+                stv_int = self._stop_type_int(st_obj)
                 if stv_int == 1:
                     return "SL"
                 if stv_int == 0:
@@ -1383,11 +1379,7 @@ class EtherealVWAPStrategy:
                 if not reduce_only:
                     continue
                 st = getattr(o, "stop_type", None)
-                stv = getattr(st, "value", st)
-                try:
-                    stv_int = int(stv)
-                except Exception:
-                    stv_int = None
+                stv_int = self._stop_type_int(st)
                 # stop_type: 0=GAIN (TP), 1=LOSS (SL)
                 if stv_int == 1:
                     return "SL"
@@ -1398,7 +1390,78 @@ class EtherealVWAPStrategy:
         return None
 
     @staticmethod
-    def _order_ts_ms(o: Any) -> int:
+    def _to_ms_ts(v: Any) -> int:
+        """
+        Best-effort timestamp -> milliseconds since epoch.
+        Supports: int/float (sec or ms), numeric strings, ISO-8601 strings, datetime.
+        """
+        try:
+            if v is None:
+                return 0
+            if isinstance(v, datetime):
+                return _dt_to_ms(v if v.tzinfo else v.replace(tzinfo=timezone.utc))
+            if isinstance(v, (int, float)):
+                iv = int(v)
+                if iv <= 0:
+                    return 0
+                # heuristic: seconds vs ms
+                return iv * 1000 if iv < 10_000_000_000 else iv
+            if isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return 0
+                # numeric string?
+                try:
+                    iv = int(s)
+                    return iv * 1000 if iv < 10_000_000_000 else iv
+                except Exception:
+                    pass
+                try:
+                    fv = float(s)
+                    iv = int(fv)
+                    return iv * 1000 if iv < 10_000_000_000 else iv
+                except Exception:
+                    pass
+                # ISO-8601 string?
+                try:
+                    ss = s.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(ss)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return _dt_to_ms(dt.astimezone(timezone.utc))
+                except Exception:
+                    return 0
+        except Exception:
+            return 0
+        return 0
+
+    @staticmethod
+    def _stop_type_int(st_obj: Any) -> Optional[int]:
+        """
+        Normalize stop_type to int where possible.
+        Returns 0 (TP/GAIN), 1 (SL/LOSS) or None.
+        """
+        try:
+            stv = getattr(st_obj, "value", st_obj)
+            try:
+                stv_int = int(stv)
+                return stv_int if stv_int in {0, 1} else None
+            except Exception:
+                pass
+            s = str(stv).strip().lower()
+            if not s:
+                return None
+            # tolerate enum/string variants
+            if "loss" in s or s == "sl" or s.endswith("_loss"):
+                return 1
+            if "gain" in s or s == "tp" or s.endswith("_gain"):
+                return 0
+            return None
+        except Exception:
+            return None
+
+    @classmethod
+    def _order_ts_ms(cls, o: Any) -> int:
         """
         Best-effort order timestamp (ms).
         Prefer filledAt/updatedAt/createdAt if present.
@@ -1408,7 +1471,7 @@ class EtherealVWAPStrategy:
                 v = getattr(o, k, None)
                 if v is None:
                     continue
-                iv = int(v)
+                iv = cls._to_ms_ts(v)
                 if iv > 0:
                     return iv
             except Exception:
@@ -1448,11 +1511,7 @@ class EtherealVWAPStrategy:
                 if not reduce_only:
                     continue
                 st = getattr(o, "stop_type", None)
-                stv = getattr(st, "value", st)
-                try:
-                    stv_int = int(stv)
-                except Exception:
-                    continue
+                stv_int = self._stop_type_int(st)
                 if stv_int not in {0, 1}:
                     continue
 
