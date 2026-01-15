@@ -823,6 +823,122 @@ class EtherealVWAPStrategy:
                 continue
         return Decimal("0")
 
+    def _order_stop_price(self, o: Any) -> Optional[Decimal]:
+        for k in ("stop_price", "stopPrice", "trigger_price", "triggerPrice", "stopPriceX18", "stop_price_x18"):
+            try:
+                v = getattr(o, k, None)
+                if v is None:
+                    continue
+                d = _as_decimal(v)
+                if _is_pos_finite_decimal(d) and d > 0:
+                    return d
+            except Exception:
+                continue
+        return None
+
+    def _infer_exit_reason_from_order(self, *, oid: str, o: Any) -> Optional[str]:
+        """
+        Infer SL/TP from order fields when stop_type is missing/unreliable.
+        Priority:
+        - stop_type (normalized)
+        - stop_price match against cached exit_levels
+        - client_order_id hint (TP/SL)
+        - state exit_orders id mapping
+        """
+        st_obj = getattr(o, "stop_type", None)
+        stv_int = self._stop_type_int(st_obj)
+        if stv_int == 1:
+            return "SL"
+        if stv_int == 0:
+            return "TP"
+
+        # stop_price comparison vs cached exit trigger levels
+        sp = self._order_stop_price(o)
+        if sp is not None and _is_pos_finite_decimal(sp):
+            levels = self.state.get("exit_levels") or {}
+            try:
+                tp = _as_decimal(levels.get("tp")) if levels.get("tp") is not None else None
+            except Exception:
+                tp = None
+            try:
+                sl = _as_decimal(levels.get("sl")) if levels.get("sl") is not None else None
+            except Exception:
+                sl = None
+            tol = self.product_tick_size if _is_pos_finite_decimal(self.product_tick_size) else Decimal("0")
+            if tol <= 0:
+                tol = Decimal("0.00000001")
+            tol = tol * Decimal("2")
+            if tp is not None and _is_pos_finite_decimal(tp) and (sp - tp).copy_abs() <= tol:
+                return "TP"
+            if sl is not None and _is_pos_finite_decimal(sl) and (sp - sl).copy_abs() <= tol:
+                return "SL"
+
+        # client_order_id marker (our ids include "TP"/"SL")
+        try:
+            cid = str(getattr(o, "client_order_id", "") or getattr(o, "clientOrderId", "") or "")
+        except Exception:
+            cid = ""
+        cid_u = cid.upper()
+        if "SL" in cid_u and "TP" not in cid_u:
+            return "SL"
+        if "TP" in cid_u and "SL" not in cid_u:
+            return "TP"
+
+        # fallback to state mapping by id
+        eo = self.state.get("exit_orders") or {}
+        if oid and oid == eo.get("sl"):
+            return "SL"
+        if oid and oid == eo.get("tp"):
+            return "TP"
+        return None
+
+    @staticmethod
+    def _order_debug_kv(o: Any) -> dict[str, str]:
+        """
+        Compact order debug fields (safe for logs).
+        """
+        out: dict[str, str] = {}
+        for k in (
+            "id",
+            "status",
+            "group_id",
+            "groupId",
+            "client_order_id",
+            "clientOrderId",
+            "reduce_only",
+            "reduceOnly",
+            "close",
+            "isClose",
+            "stop_type",
+            "stopType",
+            "stop_price",
+            "stopPrice",
+            "trigger_price",
+            "triggerPrice",
+            "filled",
+            "filledQty",
+            "filled_quantity",
+            "filledQuantity",
+            "filledAt",
+            "filled_at",
+            "updatedAt",
+            "updated_at",
+            "createdAt",
+            "created_at",
+            "price",
+            "average_price",
+            "avg_price",
+            "avgFillPrice",
+        ):
+            try:
+                v = getattr(o, k, None)
+            except Exception:
+                v = None
+            if v is None:
+                continue
+            out[k] = str(v)
+        return out
+
     @staticmethod
     def _is_filled_status(status: str) -> bool:
         """
@@ -1373,26 +1489,17 @@ class EtherealVWAPStrategy:
                 status = (getattr(o, "status", "") or "").upper()
                 if not self._order_is_filled(o):
                     continue
-                st_obj = getattr(o, "stop_type", None)
-                filled.append((str(oid), st_obj))
+                filled.append((str(oid), o))
 
             if not filled:
                 return None
 
-            # Prefer stop_type over state mapping (state can drift after restarts / 404s).
-            for _, st_obj in filled:
-                stv_int = self._stop_type_int(st_obj)
-                if stv_int == 1:
-                    return "SL"
-                if stv_int == 0:
-                    return "TP"
-            # If we can't infer from stop_type, fallback to state mapping.
-            eo = self.state.get("exit_orders") or {}
-            for oid, _ in filled:
-                if oid == eo.get("sl"):
-                    return "SL"
-                if oid == eo.get("tp"):
-                    return "TP"
+            # Infer per filled order (stop_type/stop_price/client_id/state mapping).
+            for oid, o in filled:
+                r = self._infer_exit_reason_from_order(oid=oid, o=o)
+                if r in {"SL", "TP"}:
+                    return r
+            # If we still can't infer, but we saw a fill, default to TP (less risky than pausing by mistake).
             return "TP"
         except Exception:
             return None
@@ -1452,13 +1559,10 @@ class EtherealVWAPStrategy:
                 )
                 if not reduce_only:
                     continue
-                st = getattr(o, "stop_type", None)
-                stv_int = self._stop_type_int(st)
-                # stop_type: 0=GAIN (TP), 1=LOSS (SL)
-                if stv_int == 1:
-                    return "SL"
-                if stv_int == 0:
-                    return "TP"
+                oid = str(getattr(o, "id", "") or "")
+                r = self._infer_exit_reason_from_order(oid=oid, o=o)
+                if r in {"SL", "TP"}:
+                    return r
             except Exception:
                 continue
         return None
@@ -1826,6 +1930,29 @@ class EtherealVWAPStrategy:
                 if not last_ms or (now_ms - last_ms) >= 60_000:
                     self.state["pause_diag_last_log_ms"] = int(now_ms)
                     self._save_state()
+                    # Best-effort: dump exit order details to understand what the API returns on stop fills.
+                    try:
+                        dump = []
+                        for x in exit_ids:
+                            try:
+                                oo = await self.client.get_order(id=UUID(str(x)))
+                                dump.append({"id": str(x), "ok": "1", **self._order_debug_kv(oo)})
+                            except Exception as ee:
+                                dump.append({"id": str(x), "ok": "0", "err": str(ee)})
+                        # Also include cached exit levels for matching.
+                        levels = self.state.get("exit_levels") or {}
+                        logger.warning(
+                            "CLOSE reason unknown details: ticker=%s levels(tp=%s sl=%s) exit_orders=%s",
+                            self.cfg.ticker,
+                            str(levels.get("tp")),
+                            str(levels.get("sl")),
+                            str(self.state.get("exit_orders") or {}),
+                        )
+                        # Log per-id summaries (compact).
+                        for row in dump[:6]:
+                            logger.warning("CLOSE reason unknown exit_order: %s", str(row))
+                    except Exception:
+                        pass
                     logger.warning(
                         "CLOSE detected but reason unknown: ticker=%s strategy=%s dir=%s prev_pos=%s now_pos=%s exit_ids=%s group=%s placed_ms=%s",
                         self.cfg.ticker,
