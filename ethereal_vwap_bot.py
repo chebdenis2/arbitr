@@ -284,6 +284,9 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_position_size", "0")
         self.state.setdefault("last_close_reason", None)
         self.state.setdefault("last_close_at", None)
+        # Robust close detection via recent FILLED reduce-only stop orders (for pause-after-SL).
+        self.state.setdefault("last_handled_reduce_stop_order_id", None)
+        self.state.setdefault("last_handled_reduce_stop_ts", 0)  # ms
 
         # Candle tracking for trailing stop (prices use reference price from get_oracle_price()).
         self.state.setdefault("candle_open_price", None)  # str Decimal
@@ -1295,6 +1298,84 @@ class EtherealVWAPStrategy:
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    def _order_ts_ms(o: Any) -> int:
+        """
+        Best-effort order timestamp (ms).
+        Prefer filledAt/updatedAt/createdAt if present.
+        """
+        for k in ("filledAt", "filled_at", "updatedAt", "updated_at", "createdAt", "created_at"):
+            try:
+                v = getattr(o, k, None)
+                if v is None:
+                    continue
+                iv = int(v)
+                if iv > 0:
+                    return iv
+            except Exception:
+                continue
+        return 0
+
+    async def _detect_recent_reduce_only_stop_fill(self) -> Optional[tuple[str, str, int]]:
+        """
+        Scan recent orders and return (reason, order_id, ts_ms) for the latest *new* FILLED reduce-only stop order.
+        reason: 'SL' if stop_type==1, 'TP' if stop_type==0
+        """
+        if not self.subaccount_id or not self.product_id:
+            return None
+        last_ts = int(self.state.get("last_handled_reduce_stop_ts") or 0)
+        last_id = str(self.state.get("last_handled_reduce_stop_order_id") or "")
+
+        try:
+            orders = await self.client.list_orders(
+                subaccount_id=str(self.subaccount_id),
+                product_ids=[str(self.product_id)],
+                limit=100,
+                order="desc",
+                order_by="createdAt",
+            )
+        except Exception:
+            return None
+        if not orders:
+            return None
+
+        best: Optional[tuple[str, str, int]] = None
+        for o in orders:
+            try:
+                status = (getattr(o, "status", "") or "").upper()
+                if status != "FILLED":
+                    continue
+                reduce_only = bool(getattr(o, "reduce_only", False) or getattr(o, "reduceOnly", False))
+                if not reduce_only:
+                    continue
+                st = getattr(o, "stop_type", None)
+                stv = getattr(st, "value", st)
+                try:
+                    stv_int = int(stv)
+                except Exception:
+                    continue
+                if stv_int not in {0, 1}:
+                    continue
+
+                oid = str(getattr(o, "id", "") or "")
+                ts = self._order_ts_ms(o)
+                if not oid or ts <= 0:
+                    continue
+                # Dedup: ignore already handled
+                if oid == last_id:
+                    continue
+                if ts <= last_ts:
+                    continue
+
+                reason = "SL" if stv_int == 1 else "TP"
+                cand = (reason, oid, ts)
+                if best is None or ts > best[2]:
+                    best = cand
+            except Exception:
+                continue
+
+        return best
 
     async def _check_and_handle_exit_fills(
         self,
@@ -2310,6 +2391,25 @@ class EtherealVWAPStrategy:
             return
 
         if not has_pos:
+            # Robust close detection (API scan): catches SL/TP even when OCO ids are missing/404 or position closes between polls.
+            recent = await self._detect_recent_reduce_only_stop_fill()
+            if recent:
+                reason, oid, ts = recent
+                # Mark handled immediately to avoid repeated triggers
+                self.state["last_handled_reduce_stop_order_id"] = oid
+                self.state["last_handled_reduce_stop_ts"] = int(ts)
+                self.state["last_close_reason"] = reason
+                self.state["last_close_at"] = _ms_to_dt(int(ts)).isoformat()
+                self._save_state()
+
+                if reason == "SL":
+                    pause_min = self._pause_after_sl_minutes()
+                    if pause_min > 0:
+                        await self._cancel_entry()
+                        # Use current computed vwap/levels for logging; if NaN it's still ok.
+                        self._set_pause_after_sl(pause_min, vwap=vwap, entry_px=entry_px, tp_px=tp_px, sl_px=sl_px, source=f"recent_stop_order:{oid}")
+                        return
+
             # Detect position close transition (prev>0 -> now==0) and decide pause reason.
             closed_now = prev_size > 0 and pos_size <= 0
 
