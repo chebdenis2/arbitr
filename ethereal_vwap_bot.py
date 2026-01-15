@@ -802,6 +802,54 @@ class EtherealVWAPStrategy:
                 self._log_network_warning("get_order(status)", e)
             return None
 
+    async def _exit_orders_working(self) -> bool:
+        """
+        Best-effort check whether recorded exit orders still exist and are working/filled.
+        Returns True if we should treat exits as present (to avoid duplicate placements).
+        Returns False if exits are missing/stale and should be cleared/recreated.
+        """
+        ids = list(self.state.get("exit_order_ids") or [])
+        if not ids:
+            return False
+
+        missing = 0
+        terminal = 0
+        for oid in ids:
+            try:
+                st = await self._confirm_order_status(str(oid))
+            except Exception:
+                st = None
+            if st is None:
+                # Unknown (network/propagation). Treat as present to avoid thrashing.
+                return True
+            if st.upper() == "FILLED":
+                return True
+            if st.upper() in {"NEW", "PENDING", "FILLED_PARTIAL"}:
+                return True
+            if st.upper() in {"CANCELED", "EXPIRED", "REJECTED"}:
+                terminal += 1
+                continue
+            # If we can't classify, treat as present.
+            return True
+
+        # If all are terminal/missing, treat as not working.
+        return not (terminal >= len(ids) or missing >= len(ids))
+
+    async def _ensure_exits_state_is_fresh(self) -> None:
+        """
+        If state thinks exits exist but API says they're gone, clear exits state so we can recreate.
+        """
+        if not self.state.get("exit_order_ids"):
+            return
+        try:
+            working = await self._exit_orders_working()
+        except Exception:
+            working = True
+        if not working:
+            logger.warning("Exits appear stale/missing; clearing exit state to recreate TP/SL.")
+            await self._cancel_exits()
+            self._save_state()
+
     async def _hydrate_exit_levels_from_api(self) -> None:
         """
         Best-effort: if we have exit order ids but lost cached exit_levels, fetch stop prices
@@ -1181,6 +1229,8 @@ class EtherealVWAPStrategy:
         Place OCO exits using an explicit quantity (used for anchor_open immediate protection).
         This avoids waiting for position visibility, so a new anchor_open entry isn't left without TP/SL.
         """
+        # If state contains stale exit ids, clear them first.
+        await self._ensure_exits_state_is_fresh()
         if self.state.get("exit_order_ids"):
             return
         q = self._round_qty(qty)
@@ -1613,6 +1663,8 @@ class EtherealVWAPStrategy:
 
         # 2) If we have a position, ensure exits exist using stored TP/SL.
         if has_pos and pos:
+            # If exits are recorded but disappeared, clear state so we can recreate.
+            await self._ensure_exits_state_is_fresh()
             if not self.state.get("exit_order_ids"):
                 try:
                     tp = _as_decimal(self.state.get("anchor_open_tp_price"))
