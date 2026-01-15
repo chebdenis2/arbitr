@@ -815,7 +815,7 @@ class EtherealVWAPStrategy:
         """Fetch order by id and return status (upper)."""
         try:
             o = await self.client.get_order(id=UUID(order_id))
-            return (getattr(o, "status", "") or "").upper()
+            return str(getattr(o, "status", "") or "").upper()
         except Exception as e:
             if _is_connect_error(e):
                 self._log_network_warning("get_order(status)", e)
@@ -1502,7 +1502,6 @@ class EtherealVWAPStrategy:
                     if _is_order_not_found_error(e):
                         continue
                     raise
-                status = (getattr(o, "status", "") or "").upper()
                 if not self._order_is_filled(o):
                     continue
                 filled.append((str(oid), o))
@@ -1560,7 +1559,6 @@ class EtherealVWAPStrategy:
         want_group = str(self.state.get("exit_group_id") or "")
         for o in orders:
             try:
-                status = (getattr(o, "status", "") or "").upper()
                 if not self._order_is_filled(o):
                     continue
                 # match group if we have it (preferred)
@@ -1712,7 +1710,6 @@ class EtherealVWAPStrategy:
         best: Optional[tuple[str, str, int]] = None
         for o in orders:
             try:
-                status = (getattr(o, "status", "") or "").upper()
                 if not self._order_is_filled(o):
                     continue
                 reduce_only = bool(
