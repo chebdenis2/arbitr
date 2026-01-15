@@ -1205,12 +1205,13 @@ class EtherealVWAPStrategy:
         if not exit_ids:
             return None
         try:
-            filled: dict[str, str] = {}
+            filled: dict[str, tuple[str, Any]] = {}
             for oid in exit_ids:
                 o = await self.client.get_order(id=UUID(str(oid)))
                 status = (getattr(o, "status", "") or "").upper()
-                filled[oid] = status
-            for oid, st in filled.items():
+                st_obj = getattr(o, "stop_type", None)
+                filled[oid] = (status, st_obj)
+            for oid, (st, st_obj) in filled.items():
                 if st != "FILLED":
                     continue
                 eo = self.state.get("exit_orders") or {}
@@ -1218,7 +1219,17 @@ class EtherealVWAPStrategy:
                     return "SL"
                 if oid == eo.get("tp"):
                     return "TP"
-                # fallback if state is missing mapping
+                # If state mapping is missing, infer from stop_type (0=TP, 1=SL).
+                try:
+                    stv = getattr(st_obj, "value", st_obj)
+                    stv_int = int(stv)
+                except Exception:
+                    stv_int = None
+                if stv_int == 1:
+                    return "SL"
+                if stv_int == 0:
+                    return "TP"
+                # fallback if we can't infer
                 return "TP"
             return None
         except Exception:
