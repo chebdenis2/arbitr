@@ -1981,12 +1981,14 @@ class EtherealVWAPStrategy:
         recent_reason: Optional[str] = None
         recent_oid: Optional[str] = None
         recent_ts: Optional[int] = None
-        try:
-            recent = await self._detect_recent_reduce_only_stop_fill()
-            if recent:
-                recent_reason, recent_oid, recent_ts = str(recent[0]), str(recent[1]), int(recent[2])
-        except Exception:
-            recent_reason = None
+        # Avoid false positives on startup when we have no exit context and no close transition.
+        if has_exit_ctx or closed_transition:
+            try:
+                recent = await self._detect_recent_reduce_only_stop_fill()
+                if recent:
+                    recent_reason, recent_oid, recent_ts = str(recent[0]), str(recent[1]), int(recent[2])
+            except Exception:
+                recent_reason = None
 
         # If we have a recent reduce-only stop fill (for our group/placed window), treat as a close event.
         if recent_reason in {"SL", "TP"}:
@@ -3058,6 +3060,11 @@ class EtherealVWAPStrategy:
         now = _utc_now()
         now_ts = int(now.timestamp())
         until_ts = now_ts + minutes * 60
+        # If we're already paused for SL and the new deadline is nearly identical, skip duplicate pause logs.
+        if self.state.get("trading_paused") and str(self.state.get("pause_reason") or "") == "SL_TIMER":
+            cur_until = int(self.state.get("pause_until_ts") or 0)
+            if cur_until and (until_ts - cur_until) <= 30:
+                return
         sname = (strategy or self._cfg_strategy() or "").strip().lower() or "vwap"
         td = self._normalize_direction_value(
             trade_direction or self.state.get("anchor_open_direction") or self.state.get("vwap_trade_direction") or self.direction
