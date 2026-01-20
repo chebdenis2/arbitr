@@ -160,6 +160,8 @@ class StrategyConfig:
     # Optional: do not trigger pause immediately on startup due to historical stop fills.
     # If true, the bot will mark all reduce-only stop fills up to startup time as "already handled".
     pause_skip_on_startup: bool = False
+    # Optional: ignore SL-based pause until the first real position opens after startup.
+    pause_ignore_sl_until_first_open: bool = False
 
     # ---------------------------
     # Strategy: anchor_open
@@ -277,6 +279,12 @@ class EtherealVWAPStrategy:
                     int(self.started_at_ms),
                 )
 
+        # Optional: ignore SL pause until the first real position opens after startup.
+        if bool(getattr(self.cfg, "pause_ignore_sl_until_first_open", False)):
+            self.state["opened_since_startup"] = False
+            self.state["opened_since_startup_ms"] = int(self.started_at_ms)
+            self._save_state()
+
     async def initialize(
         self,
         *,
@@ -381,6 +389,9 @@ class EtherealVWAPStrategy:
         self.state.setdefault("last_handled_reduce_stop_ts", 0)  # ms
         # Process startup time (ms) for optional pause-skip behavior.
         self.state.setdefault("startup_ms", 0)
+        # Track first open after startup (used to optionally ignore SL pause until a real open).
+        self.state.setdefault("opened_since_startup", False)
+        self.state.setdefault("opened_since_startup_ms", 0)
         # Throttle repeated network error logs.
         self.state.setdefault("last_connect_error_log_ms", 0)
         # Throttle unknown-close diagnostics.
@@ -1933,18 +1944,26 @@ class EtherealVWAPStrategy:
         if reason == "SL":
             pause_min = self._pause_after_sl_minutes()
             if pause_min > 0:
-                await self._cancel_entry()
-                self._set_pause_after_sl(
-                    pause_min,
-                    vwap=vwap,
-                    entry_px=entry_px,
-                    tp_px=tp_px,
-                    sl_px=sl_px,
-                    source="exit_fill",
-                    trade_direction=pause_td,
-                    strategy=pause_strategy,
-                )
-                return True
+                if self._should_ignore_sl_pause():
+                    logger.info(
+                        "SL pause ignored until first open: ticker=%s strategy=%s dir=%s source=exit_fill",
+                        self.cfg.ticker,
+                        pause_strategy,
+                        pause_td,
+                    )
+                else:
+                    await self._cancel_entry()
+                    self._set_pause_after_sl(
+                        pause_min,
+                        vwap=vwap,
+                        entry_px=entry_px,
+                        tp_px=tp_px,
+                        sl_px=sl_px,
+                        source="exit_fill",
+                        trade_direction=pause_td,
+                        strategy=pause_strategy,
+                    )
+                    return True
 
         self._save_state()
         logger.info(
@@ -2010,17 +2029,25 @@ class EtherealVWAPStrategy:
             if recent_reason == "SL":
                 pause_min = self._pause_after_sl_minutes()
                 if pause_min > 0:
-                    self._set_pause_after_sl(
-                        pause_min,
-                        vwap=vwap,
-                        entry_px=entry_px,
-                        tp_px=tp_px,
-                        sl_px=sl_px,
-                        source=f"recent_stop_order:{recent_oid or ''}".strip(":"),
-                        trade_direction=pause_td,
-                        strategy=pause_strategy,
-                    )
-                    return True
+                    if self._should_ignore_sl_pause():
+                        logger.info(
+                            "SL pause ignored until first open: ticker=%s strategy=%s dir=%s source=recent_stop_order",
+                            self.cfg.ticker,
+                            pause_strategy,
+                            pause_td,
+                        )
+                    else:
+                        self._set_pause_after_sl(
+                            pause_min,
+                            vwap=vwap,
+                            entry_px=entry_px,
+                            tp_px=tp_px,
+                            sl_px=sl_px,
+                            source=f"recent_stop_order:{recent_oid or ''}".strip(":"),
+                            trade_direction=pause_td,
+                            strategy=pause_strategy,
+                        )
+                        return True
             return False
 
         # If position likely closed (transition) and we have exit context, try to infer close reason.
@@ -2049,17 +2076,25 @@ class EtherealVWAPStrategy:
                 if reason == "SL":
                     pause_min = self._pause_after_sl_minutes()
                     if pause_min > 0:
-                        self._set_pause_after_sl(
-                            pause_min,
-                            vwap=vwap,
-                            entry_px=entry_px,
-                            tp_px=tp_px,
-                            sl_px=sl_px,
-                            source="position_close",
-                            trade_direction=pause_td,
-                            strategy=pause_strategy,
-                        )
-                        return True
+                        if self._should_ignore_sl_pause():
+                            logger.info(
+                                "SL pause ignored until first open: ticker=%s strategy=%s dir=%s source=position_close",
+                                self.cfg.ticker,
+                                pause_strategy,
+                                pause_td,
+                            )
+                        else:
+                            self._set_pause_after_sl(
+                                pause_min,
+                                vwap=vwap,
+                                entry_px=entry_px,
+                                tp_px=tp_px,
+                                sl_px=sl_px,
+                                source="position_close",
+                                trade_direction=pause_td,
+                                strategy=pause_strategy,
+                            )
+                            return True
             else:
                 # Diagnostic (throttled): we saw a close transition but couldn't infer SL/TP.
                 now_ms = _dt_to_ms(_utc_now())
@@ -2191,6 +2226,11 @@ class EtherealVWAPStrategy:
         )
         out = self._normalize_direction_value(d)
         return out if out in {"LONG", "SHORT"} else "LONG"
+
+    def _should_ignore_sl_pause(self) -> bool:
+        if not bool(getattr(self.cfg, "pause_ignore_sl_until_first_open", False)):
+            return False
+        return not bool(self.state.get("opened_since_startup"))
 
     def _infer_direction_from_position(self, pos: Optional[dict]) -> Optional[str]:
         if not pos:
@@ -3351,6 +3391,12 @@ class EtherealVWAPStrategy:
         self.state["no_position_streak"] = int(streak)
         # NOTE: we save state only on meaningful events to avoid excessive writes.
 
+        opened_transition = (not _is_pos_finite_decimal(prev_size) or prev_size <= 0) and pos_size > 0
+        if has_pos and not bool(self.state.get("opened_since_startup")):
+            self.state["opened_since_startup"] = True
+            self.state["opened_since_startup_ms"] = int(now_ms)
+            self._save_state()
+
         trade_dir = self._resolve_vwap_auto_direction(
             anchor_start_ms=anchor_start_ms,
             now_ms=now_ms,
@@ -3358,6 +3404,9 @@ class EtherealVWAPStrategy:
             has_pos=has_pos,
             pos=pos,
         )
+        if opened_transition:
+            od = trade_dir or self._infer_direction_from_position(pos) or self._pause_trade_direction()
+            logger.info("POSITION OPENED: ticker=%s dir=%s size=%s", self.cfg.ticker, str(od), str(pos_size))
         entry_px, tp_px, sl_px = self._levels(vwap, direction=trade_dir)
 
         # Handle SL/TP fills even if position visibility lags.
@@ -3622,6 +3671,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 pause_on_sl=bool(raw.get("pause_on_sl", False)),
                 pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
                 pause_skip_on_startup=bool(raw.get("pause_skip_on_startup", False)),
+                pause_ignore_sl_until_first_open=bool(raw.get("pause_ignore_sl_until_first_open", False)),
                 anchor_open_min_delta_pct=_as_decimal(raw.get("anchor_open_min_delta_pct", raw.get("anchor_open_min_vwap_delta_pct", "0"))),
                 anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
                 anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
@@ -3668,6 +3718,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "pause_on_sl": cfg.pause_on_sl,
                 "pause_after_sl_minutes": cfg.pause_after_sl_minutes,
                 "pause_skip_on_startup": bool(getattr(cfg, "pause_skip_on_startup", False)),
+                "pause_ignore_sl_until_first_open": bool(getattr(cfg, "pause_ignore_sl_until_first_open", False)),
                 "anchor_open_min_delta_pct": str(cfg.anchor_open_min_delta_pct),
                 "anchor_open_sl_pct_of_tp": str(cfg.anchor_open_sl_pct_of_tp),
                 "anchor_open_close_on_anchor_end": cfg.anchor_open_close_on_anchor_end,
@@ -3744,6 +3795,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         pause_on_sl=bool(raw.get("pause_on_sl", False)),
         pause_after_sl_minutes=int(raw.get("pause_after_sl_minutes", 0) or 0),
         pause_skip_on_startup=bool(raw.get("pause_skip_on_startup", False)),
+        pause_ignore_sl_until_first_open=bool(raw.get("pause_ignore_sl_until_first_open", False)),
         anchor_open_min_delta_pct=_as_decimal(raw.get("anchor_open_min_delta_pct", raw.get("anchor_open_min_vwap_delta_pct", "0"))),
         anchor_open_sl_pct_of_tp=_as_decimal(raw.get("anchor_open_sl_pct_of_tp", "100")),
         anchor_open_close_on_anchor_end=bool(raw.get("anchor_open_close_on_anchor_end", True)),
@@ -3787,6 +3839,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "pause_on_sl": cfg.pause_on_sl,
         "pause_after_sl_minutes": int(getattr(cfg, "pause_after_sl_minutes", 0) or 0),
         "pause_skip_on_startup": bool(getattr(cfg, "pause_skip_on_startup", False)),
+        "pause_ignore_sl_until_first_open": bool(getattr(cfg, "pause_ignore_sl_until_first_open", False)),
         "anchor_open_min_delta_pct": str(getattr(cfg, "anchor_open_min_delta_pct", Decimal("0"))),
         "anchor_open_sl_pct_of_tp": str(getattr(cfg, "anchor_open_sl_pct_of_tp", Decimal("100"))),
         "anchor_open_close_on_anchor_end": bool(getattr(cfg, "anchor_open_close_on_anchor_end", True)),
