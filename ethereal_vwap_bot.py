@@ -126,6 +126,9 @@ class StrategyConfig:
     # VWAP auto-direction (direction="BOTH"): choose LONG/SHORT per anchor if the
     # new anchor open differs from previous anchor VWAP by this threshold (%).
     vwap_both_min_delta_pct: Decimal = Decimal("0.1")
+    # VWAP auto-direction startup hint when there is no prev_anchor_vwap yet:
+    # "LONG" | "SHORT" | "NONE" (default waits for first completed anchor).
+    vwap_both_start_direction: str = "NONE"
     poll_interval_sec: int = 3
     # Candle timeframe used for "new candle" refresh logic (like original bot).
     timeframe: str = "1h"
@@ -444,6 +447,8 @@ class EtherealVWAPStrategy:
         self.state.setdefault("vwap_anchor_last_wait_log_ms", 0)
         self.state.setdefault("vwap_trade_direction", None)  # LONG|SHORT
         self.state.setdefault("vwap_direction_unknown_log_ms", 0)
+        self.state.setdefault("vwap_last_auto_direction", None)  # LONG|SHORT
+        self.state.setdefault("vwap_start_direction_used_anchor_ms", 0)
 
     def _save_state(self) -> None:
         with open(self.state_file, "w", encoding="utf-8") as f:
@@ -2138,6 +2143,42 @@ class EtherealVWAPStrategy:
             return Decimal("0")
         return thr
 
+    def _auto_vwap_start_direction(self) -> Optional[str]:
+        raw = str(getattr(self.cfg, "vwap_both_start_direction", "NONE") or "NONE").strip().upper()
+        if raw in {"", "NONE", "WAIT", "DISABLED", "OFF"}:
+            return None
+        d = self._normalize_direction_value(raw)
+        return d if d in {"LONG", "SHORT"} else None
+
+    @staticmethod
+    def _color_direction_label(d: str) -> str:
+        if d == "LONG":
+            return "\x1b[32mLONG\x1b[0m"
+        if d == "SHORT":
+            return "\x1b[31mSHORT\x1b[0m"
+        return str(d or "")
+
+    def _log_vwap_direction_change(self, *, new_dir: str, prev_dir: Optional[str], reason: str) -> None:
+        new_norm = self._normalize_direction_value(new_dir)
+        if new_norm not in {"LONG", "SHORT"}:
+            return
+        prev_norm = self._normalize_direction_value(prev_dir)
+        if prev_norm in {"LONG", "SHORT"} and prev_norm != new_norm:
+            logger.info(
+                "VWAP BOTH direction change: ticker=%s prev=%s new=%s reason=%s",
+                self.cfg.ticker,
+                prev_norm,
+                self._color_direction_label(new_norm),
+                reason,
+            )
+        else:
+            logger.info(
+                "VWAP BOTH direction: ticker=%s dir=%s reason=%s",
+                self.cfg.ticker,
+                self._color_direction_label(new_norm),
+                reason,
+            )
+
     def _pause_trade_direction(self, fallback: Optional[str] = None) -> str:
         d = (
             self.state.get("anchor_open_direction")
@@ -2255,6 +2296,16 @@ class EtherealVWAPStrategy:
 
         prev_vwap = self._decimal_from_state("prev_anchor_vwap")
         if prev_vwap is None or not _is_pos_finite_decimal(prev_vwap):
+            start_dir = self._auto_vwap_start_direction()
+            if start_dir in {"LONG", "SHORT"}:
+                used_anchor = int(self.state.get("vwap_start_direction_used_anchor_ms") or 0)
+                if used_anchor != int(anchor_start_ms):
+                    prev_dir = self.state.get("vwap_last_auto_direction")
+                    self.state["vwap_last_auto_direction"] = start_dir
+                    self.state["vwap_start_direction_used_anchor_ms"] = int(anchor_start_ms)
+                    self._save_state()
+                    self._log_vwap_direction_change(new_dir=start_dir, prev_dir=prev_dir, reason="startup")
+                return start_dir
             return None
 
         open_px = self._price_from_state("vwap_anchor_open_price")
@@ -2287,18 +2338,13 @@ class EtherealVWAPStrategy:
             return None
 
         trade_dir = "LONG" if open_px > prev_vwap else "SHORT"
+        prev_dir = self.state.get("vwap_last_auto_direction")
         self.state["vwap_anchor_decision_anchor_ms"] = int(anchor_start_ms)
         self.state["vwap_anchor_direction"] = trade_dir
         self.state["vwap_anchor_delta_pct"] = str(delta_pct)
+        self.state["vwap_last_auto_direction"] = trade_dir
         self._save_state()
-        logger.info(
-            "VWAP BOTH direction: %s (open=%s prev_vwap=%s delta_pct=%s thr=%s)",
-            trade_dir,
-            str(open_px),
-            str(prev_vwap),
-            str(delta_pct),
-            str(thr),
-        )
+        self._log_vwap_direction_change(new_dir=trade_dir, prev_dir=prev_dir, reason="delta")
         return trade_dir
 
     def _clear_vwap_trade_direction(self) -> None:
@@ -3553,6 +3599,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 ticker=str(raw.get("ticker", "SOLUSD")),
                 direction=str(raw.get("direction", "LONG")).upper(),
                 vwap_both_min_delta_pct=_as_decimal(raw.get("vwap_both_min_delta_pct", "0.1")),
+                vwap_both_start_direction=str(raw.get("vwap_both_start_direction", "NONE")),
                 poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
                 timeframe=str(raw.get("timeframe", "1h")),
                 anchor_period=str(raw.get("anchor_period", "Session")),
@@ -3598,6 +3645,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "vwap_both_min_delta_pct": str(cfg.vwap_both_min_delta_pct),
+                "vwap_both_start_direction": str(getattr(cfg, "vwap_both_start_direction", "NONE")),
                 "poll_interval_sec": cfg.poll_interval_sec,
                 "timeframe": cfg.timeframe,
                 "anchor_period": cfg.anchor_period,
@@ -3673,6 +3721,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
         direction=str(raw.get("direction", "LONG")).strip().upper(),
         vwap_both_min_delta_pct=_as_decimal(raw.get("vwap_both_min_delta_pct", "0.1")),
+        vwap_both_start_direction=str(raw.get("vwap_both_start_direction", "NONE")),
         poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
         timeframe=str(raw.get("timeframe", "1h")),
         anchor_period=str(raw.get("anchor_period", "Session")),
@@ -3715,6 +3764,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "ticker": cfg.ticker,
         "direction": cfg.direction,
         "vwap_both_min_delta_pct": str(getattr(cfg, "vwap_both_min_delta_pct", Decimal("0.1"))),
+        "vwap_both_start_direction": str(getattr(cfg, "vwap_both_start_direction", "NONE")),
         "poll_interval_sec": cfg.poll_interval_sec,
         "timeframe": cfg.timeframe,
         "anchor_period": cfg.anchor_period,
