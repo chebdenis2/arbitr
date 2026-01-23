@@ -3954,24 +3954,45 @@ async def amain() -> None:
 
             # Safety: this bot is NOT hedge-mode. Running multiple strategies on the same ticker in the same
             # subaccount will cause exit/position management conflicts and can stall trading (stale exits, cancels, etc.).
-            by_ticker: dict[str, list[StrategyConfig]] = {}
+            # If duplicates are identical, keep the first entry and warn (helps recover from accidental copy/paste).
+            by_ticker: dict[str, StrategyConfig] = {}
+            dup: dict[str, list[StrategyConfig]] = {}
+            mismatched: dict[str, list[StrategyConfig]] = {}
+            deduped_cfgs: list[StrategyConfig] = []
             for c in cfgs:
                 t = (c.ticker or "").strip().upper()
                 if not t:
                     continue
-                by_ticker.setdefault(t, []).append(c)
-            dup = {t: lst for t, lst in by_ticker.items() if len(lst) > 1}
+                existing = by_ticker.get(t)
+                if existing is None:
+                    by_ticker[t] = c
+                    deduped_cfgs.append(c)
+                    continue
+                dup.setdefault(t, [existing]).append(c)
+                if c != existing:
+                    mismatched[t] = dup[t]
+            if mismatched:
+                details = "; ".join(
+                    f"{t}=" + ",".join(f"{(x.strategy or 'vwap')}:{(x.direction or '').upper()}" for x in lst)
+                    for t, lst in sorted(mismatched.items())
+                )
+                raise RuntimeError(
+                    "Invalid multi config: multiple different strategies for the same ticker in one subaccount. "
+                    "This bot supports only ONE strategy per ticker per subaccount. "
+                    "Remove duplicates or use separate subaccounts. "
+                    f"Duplicates: {details}"
+                )
             if dup:
                 details = "; ".join(
                     f"{t}=" + ",".join(f"{(x.strategy or 'vwap')}:{(x.direction or '').upper()}" for x in lst)
                     for t, lst in sorted(dup.items())
                 )
-                raise RuntimeError(
-                    "Invalid multi config: multiple strategies for the same ticker in one subaccount. "
-                    "This bot supports only ONE strategy per ticker per subaccount. "
-                    "Use separate subaccounts if you need LONG+SHORT simultaneously. "
-                    f"Duplicates: {details}"
+                logger.warning(
+                    "Duplicate ticker entries in multi config; keeping first entry per ticker. "
+                    "Remove duplicates or use separate subaccounts. Duplicates: %s",
+                    details,
                 )
+                cfgs = deduped_cfgs
 
             # Optional global override for multi-mode.
             # We keep it explicit to avoid unintentionally overwriting per-instrument config.
