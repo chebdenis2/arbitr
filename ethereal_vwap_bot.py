@@ -126,6 +126,9 @@ class StrategyConfig:
     # VWAP auto-direction (direction="BOTH"): choose LONG/SHORT per anchor if the
     # new anchor open differs from previous anchor VWAP by this threshold (%).
     vwap_both_min_delta_pct: Decimal = Decimal("0.1")
+    # Optional max delta threshold (%). If > 0, signals above this are skipped.
+    # Example: min=0.1, max=0.3 -> accept deltas in [0.1, 0.3].
+    vwap_both_max_delta_pct: Decimal = Decimal("0")
     # VWAP auto-direction startup hint when there is no prev_anchor_vwap yet:
     # "LONG" | "SHORT" | "NONE" (default waits for first completed anchor).
     vwap_both_start_direction: str = "NONE"
@@ -2184,6 +2187,12 @@ class EtherealVWAPStrategy:
             return Decimal("0")
         return thr
 
+    def _auto_vwap_max_threshold_pct(self) -> Decimal:
+        thr = _as_decimal(getattr(self.cfg, "vwap_both_max_delta_pct", Decimal("0")) or "0")
+        if thr <= 0:
+            return Decimal("0")
+        return thr
+
     def _auto_vwap_start_direction(self) -> Optional[str]:
         raw = str(getattr(self.cfg, "vwap_both_start_direction", "NONE") or "NONE").strip().upper()
         if raw in {"", "NONE", "WAIT", "DISABLED", "OFF"}:
@@ -2384,6 +2393,21 @@ class EtherealVWAPStrategy:
                 "VWAP BOTH skip: delta_pct=%s < thr=%s (prev_vwap=%s open=%s)",
                 str(delta_pct),
                 str(thr),
+                str(prev_vwap),
+                str(open_px),
+            )
+            return None
+
+        max_thr = self._auto_vwap_max_threshold_pct()
+        if max_thr > 0 and delta_pct > max_thr:
+            self.state["vwap_anchor_decision_anchor_ms"] = int(anchor_start_ms)
+            self.state["vwap_anchor_direction"] = None
+            self.state["vwap_anchor_delta_pct"] = str(delta_pct)
+            self._save_state()
+            logger.info(
+                "VWAP BOTH skip: delta_pct=%s > max=%s (prev_vwap=%s open=%s)",
+                str(delta_pct),
+                str(max_thr),
                 str(prev_vwap),
                 str(open_px),
             )
@@ -3668,6 +3692,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 ticker=str(raw.get("ticker", "SOLUSD")),
                 direction=str(raw.get("direction", "LONG")).upper(),
                 vwap_both_min_delta_pct=_as_decimal(raw.get("vwap_both_min_delta_pct", "0.1")),
+                vwap_both_max_delta_pct=_as_decimal(raw.get("vwap_both_max_delta_pct", "0")),
                 vwap_both_start_direction=str(raw.get("vwap_both_start_direction", "NONE")),
                 vwap_both_mode=str(raw.get("vwap_both_mode", "trend")),
                 poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -3716,6 +3741,7 @@ def _load_or_create_config(path: str) -> tuple[StrategyConfig, bool]:
                 "ticker": cfg.ticker,
                 "direction": cfg.direction,
                 "vwap_both_min_delta_pct": str(cfg.vwap_both_min_delta_pct),
+                "vwap_both_max_delta_pct": str(getattr(cfg, "vwap_both_max_delta_pct", Decimal("0"))),
                 "vwap_both_start_direction": str(getattr(cfg, "vwap_both_start_direction", "NONE")),
                 "vwap_both_mode": str(getattr(cfg, "vwap_both_mode", "trend")),
                 "poll_interval_sec": cfg.poll_interval_sec,
@@ -3794,6 +3820,7 @@ def _strategy_config_from_json(raw: dict) -> StrategyConfig:
         ticker=str(raw.get("ticker", "SOLUSD")).strip().upper(),
         direction=str(raw.get("direction", "LONG")).strip().upper(),
         vwap_both_min_delta_pct=_as_decimal(raw.get("vwap_both_min_delta_pct", "0.1")),
+        vwap_both_max_delta_pct=_as_decimal(raw.get("vwap_both_max_delta_pct", "0")),
         vwap_both_start_direction=str(raw.get("vwap_both_start_direction", "NONE")),
         vwap_both_mode=str(raw.get("vwap_both_mode", "trend")),
         poll_interval_sec=int(raw.get("poll_interval_sec", 3)),
@@ -3839,6 +3866,7 @@ def _strategy_config_to_json(cfg: StrategyConfig) -> dict:
         "ticker": cfg.ticker,
         "direction": cfg.direction,
         "vwap_both_min_delta_pct": str(getattr(cfg, "vwap_both_min_delta_pct", Decimal("0.1"))),
+        "vwap_both_max_delta_pct": str(getattr(cfg, "vwap_both_max_delta_pct", Decimal("0"))),
         "vwap_both_start_direction": str(getattr(cfg, "vwap_both_start_direction", "NONE")),
         "vwap_both_mode": str(getattr(cfg, "vwap_both_mode", "trend")),
         "poll_interval_sec": cfg.poll_interval_sec,
